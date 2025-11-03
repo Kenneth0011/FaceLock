@@ -147,12 +147,11 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     with torch.no_grad(): # 確保 clean_latent 計算不佔用梯度
         clean_latent = vae.encode(X).latent_dist.mean
 
-    # --- 「方法一」的權重修改 ---
-    # 1. 定義三個損失的權重 (lambda)
-    # 這些是您可以自行實驗和調整的超參數
-    lambda_cvl = 0.1     # (調低) 臉部辨識損失 (CVL) 的權重
-    lambda_encoder = 1.0 # (調高) 潛在空間損失 (Encoder) 的權重 (全圖)
-    lambda_lpips = 1.0   # (調高) 感知損失 (LPIPS) 的權重 (全圖)
+# --- 權重設定 (方案 C：高權重平衡) ---
+    # 我們的目標：臉部和背景 "都" 要有強烈的擾動
+    lambda_cvl = 1.0     # (高) 保留臉部防禦的原始強度
+    lambda_encoder = 3.0 # (極高) 大幅提高全圖的潛在空間防禦
+    lambda_lpips = 3.0   # (極高) 大幅提高全圖的感知防禦
     # --- 修改結束 ---
 
     for i in pbar:
