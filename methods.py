@@ -21,7 +21,8 @@ def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
         else:
             return -torch.norm(latents - clean_latents.detach(), p=2, dim=-1)
     
-    w = torch.zeros_like(X, requires_grad=True).cuda()
+    # [CPU 支援] 移除 .cuda(), 使用 .to(X.device)
+    w = torch.zeros_like(X, requires_grad=True).to(X.device) 
     pbar = tqdm(range(iters))
     optimizer = optim.Adam([w], lr=lr)
 
@@ -58,10 +59,17 @@ def encoder_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, 
         X_adv - image tensor for the protected image
     """
     encoder = model.vae.encode
-    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).half().cuda(), min=clamp_min, max=clamp_max)
+    
+    # [CPU 支援] 移除 .half().cuda()
+    # 使用 X.device 和 X.dtype 來創建隨機噪聲，確保匹配
+    rand_noise = (torch.rand(*X.shape, device=X.device, dtype=X.dtype) * 2 * eps - eps)
+    X_adv = torch.clamp(X.clone().detach() + rand_noise, min=clamp_min, max=clamp_max)
+
     if not targeted:
         loss_fn = nn.MSELoss()
-        clean_latent = encoder(X).latent_dist.mean
+        with torch.no_grad(): # 確保 clean_latent 計算不佔用梯度
+            clean_latent = encoder(X).latent_dist.mean
+            
     pbar = tqdm(range(iters))
     for i in pbar:
         actual_step_size = step_size - (step_size - step_size / 100) / iters * i
@@ -102,7 +110,12 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
         X_adv - image tensor for the protected image
     """
     vae = model.vae
-    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).half().cuda(), min=clamp_min, max=clamp_max)
+    
+    # [CPU 支援] 移除 .half().cuda()
+    # 使用 X.device 和 X.dtype 來創建隨機噪聲，確保匹配
+    rand_noise = (torch.rand(*X.shape, device=X.device, dtype=X.dtype) * 2 * eps - eps)
+    X_adv = torch.clamp(X.clone().detach() + rand_noise, min=clamp_min, max=clamp_max)
+
     pbar = tqdm(range(iters))
     for i in pbar:
         actual_step_size = step_size - (step_size - step_size / 100) / iters * i
@@ -123,12 +136,24 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
     return X_adv
 
 def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1):
-    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device), min=clamp_min, max=clamp_max).half()
+    # [CPU 支援] 使用 X.device 和 X.dtype 確保匹配
+    rand_noise = (torch.rand(*X.shape, device=X.device, dtype=X.dtype) * 2 * eps - eps)
+    X_adv = torch.clamp(X.clone().detach() + rand_noise, min=clamp_min, max=clamp_max)
+    
     pbar = tqdm(range(iters))
     
     vae = model.vae
     X_adv.requires_grad_(True)
-    clean_latent = vae.encode(X).latent_dist.mean
+    with torch.no_grad(): # 確保 clean_latent 計算不佔用梯度
+        clean_latent = vae.encode(X).latent_dist.mean
+
+    # --- 「方法一」的權重修改 ---
+    # 1. 定義三個損失的權重 (lambda)
+    # 這些是您可以自行實驗和調整的超參數
+    lambda_cvl = 0.1     # (調低) 臉部辨識損失 (CVL) 的權重
+    lambda_encoder = 1.0 # (調高) 潛在空間損失 (Encoder) 的權重 (全圖)
+    lambda_lpips = 1.0   # (調高) 感知損失 (LPIPS) 的權重 (全圖)
+    # --- 修改結束 ---
 
     for i in pbar:
         # actual_step_size = step_size
@@ -137,10 +162,19 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         latent = vae.encode(X_adv).latent_dist.mean
         image = vae.decode(latent).sample.clip(-1, 1)
 
+        # 確保 LPIPS 和 compute_score 的輸入是 .float() (float32)
         loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
         loss_encoder = F.mse_loss(latent, clean_latent)
-        loss_lpips = lpips_fn(image, X)
-        loss = -loss_cvl * (1 if i >= iters * 0.35 else 0.0) + loss_encoder * 0.2 + loss_lpips * (1 if i > iters * 0.25 else 0.0)
+        loss_lpips = lpips_fn(image.float(), X.float())
+        
+        # --- 「方法一」的損失計算 ---
+        # 2. (註解掉) 這是原始的 loss 計算
+        # loss = -loss_cvl * (1 if i >= iters * 0.35 else 0.0) + loss_encoder * 0.2 + loss_lpips * (1 if i > iters * 0.25 else 0.0)
+        
+        # 3. (新的) 使用 lambda 權重重新組合 loss，並移除 if 條件
+        loss = -loss_cvl * lambda_cvl + loss_encoder * lambda_encoder + loss_lpips * lambda_lpips
+        # --- 修改結束 ---
+        
         grad, = torch.autograd.grad(loss, [X_adv])
         X_adv = X_adv + grad.detach().sign() * actual_step_size
 
