@@ -131,12 +131,12 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     clean_latent = vae.encode(X).latent_dist.mean
 
     # --- 權重調整 ---
-    # 這是「阻止編輯」的權重，我們保持在較低的值
-    lambda_encoder = 0.05 
+    # 這是「阻止編輯」的權重，設定為 0.0 以完全移除
+    lambda_encoder = 0.0 
 
-    # 這是「破壞臉部」的權重，提高到 5.0
-    lambda_cvl = 5.0   # 臉部辨識損失權重
-    lambda_lpips = 5.0 # 特徵差異損失權重
+    # 這是「破壞臉部」的權重，保持在 2.0
+    lambda_cvl = 2.0   # 臉部辨識損失權重
+    lambda_lpips = 2.0 # 特徵差異損失權重
     # ------------------
 
     for i in pbar:
@@ -152,7 +152,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         
         # --- 修正後的損失函式 ---
         # 1. 將 + loss_lpips 改為 - loss_lpips (最大化 LPIPS 距離)
-        # 2. 應用新的 lambda_cvl 和 lambda_lpips 權重 (5.0)
+        # 2. 應用新的 lambda_encoder (0.0)
         loss = -loss_cvl * (lambda_cvl if i >= iters * 0.35 else 0.0) + \
                loss_encoder * lambda_encoder - \
                loss_lpips * (lambda_lpips if i > iters * 0.25 else 0.0)
