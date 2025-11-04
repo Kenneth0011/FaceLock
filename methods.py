@@ -130,10 +130,14 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     X_adv.requires_grad_(True)
     clean_latent = vae.encode(X).latent_dist.mean
 
-    # --- 這是您要求的修改 ---
-    # 將 lambda_encoder 的權重從 0.2 降低為 0.05
-    lambda_encoder = 0.05
-    # -----------------------
+    # --- 權重調整 ---
+    # 這是「阻止編輯」的權重，我們保持在較低的值
+    lambda_encoder = 0.05 
+
+    # 這是「破壞臉部」的權重。
+    lambda_cvl = 2.0   # 臉部辨識損失權重
+    lambda_lpips = 2.0 # 特徵差異損失權重
+    # ------------------
 
     for i in pbar:
         # actual_step_size = step_size
@@ -146,8 +150,12 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         loss_encoder = F.mse_loss(latent, clean_latent)
         loss_lpips = lpips_fn(image, X)
         
-        # --- 應用修改後的權重 ---
-        loss = -loss_cvl * (1 if i >= iters * 0.35 else 0.0) + loss_encoder * lambda_encoder + loss_lpips * (1 if i > iters * 0.25 else 0.0)
+        # --- 修正後的損失函式 ---
+        # 1. 將 + loss_lpips 改為 - loss_lpips (最大化 LPIPS 距離)
+        # 2. 應用新的 lambda_cvl 和 lambda_lpips 權重
+        loss = -loss_cvl * (lambda_cvl if i >= iters * 0.35 else 0.0) + \
+               loss_encoder * lambda_encoder - \
+               loss_lpips * (lambda_lpips if i > iters * 0.25 else 0.0)
         # ------------------------
 
         grad, = torch.autograd.grad(loss, [X_adv])
