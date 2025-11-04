@@ -132,8 +132,8 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
 
     # --- 權重調整 ---
     lambda_encoder = 0.0 # 完全移除衝突項
-    lambda_cvl = 2.0   # 臉部辨識損失權重
-    lambda_lpips = 2.0 # 特徵差異損失權重
+    lambda_cvl = 3.0   # 臉部辨識損失權重 (平衡值)
+    lambda_lpips = 3.0 # 特徵差異損失權重 (平衡值)
     # ------------------
 
     for i in pbar:
@@ -150,6 +150,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         # --- 修正後的損失函式 ---
         # 1. 完全移除預熱排程 (Warm-up Schedule)
         # 2. 攻擊從第 0 次迭代就開始
+        # 3. 使用 3.0 的權重
         loss = -loss_cvl * lambda_cvl + \
                loss_encoder * lambda_encoder - \
                loss_lpips * lambda_lpips
