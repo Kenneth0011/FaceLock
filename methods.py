@@ -9,7 +9,7 @@ import numpy as np
 from utils import compute_score
 import pdb
 
-# --- 正在載入已修正的 METHODS.PY v4 (已修復 IndexError) ---
+# --- 正在載入已修正的 METHODS.PY v5 (已修復 TypeError) ---
 # (您可以自行修改這個標記)
 
 # CW L2 attack
@@ -138,7 +138,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     device = X.device
 
     # 新的模擬超參數
-    # SIMULATION_TIMESTEP = 200 # (已移除 - 這是錯誤的來源)
     SIMULATION_STEPS = 5      # 淨化步數 (S=5)
 
     # 預先計算「無條件嵌入」（空指令）
@@ -152,10 +151,14 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     # 1. 提前初始化排程器
     scheduler.set_timesteps(num_inference_steps=50, device=device)
     
-    # 2. 不再使用任意的 '200'，而是從排程器中 *合法地* 選取一個起始點
-    #    我們從 50 步的中間點 (索引 25) 開始
+    # 2. 從 50 步的中間點 (索引 25) 開始
     t_start_index = len(scheduler.timesteps) // 2
-    t_start = scheduler.timesteps[t_start_index] # 獲取 *合法的* 時間步 (例如 481)
+    
+    # --- *** 這是錯誤修復 v3 (TypeError) *** ---
+    # 我們必須獲取一個 1D Tensor (list)，而不是 0D Tensor (scalar)
+    # 舊的: t_start = scheduler.timesteps[t_start_index] (錯誤)
+    t_start = scheduler.timesteps[t_start_index : t_start_index + 1] # (正確, e.g., tensor([481]))
+    # --- *** 修復結束 v3 *** ---
     
     # 3. 獲取我們要運行的 S 步
     timesteps_to_run = scheduler.timesteps[t_start_index : t_start_index + SIMULATION_STEPS]
@@ -186,8 +189,8 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
 
         # b. 添加噪聲 (模擬淨化的起始點)
         noise = torch.randn_like(latent)
-        # 這一行現在可以安全執行了，因為 t_start (例如 481) 100% 在 scheduler.timesteps 中
-        noisy_latent = scheduler.add_noise(latent, noise, t_start) # t_start 是一個 tensor
+        # 這一行現在可以安全執行了，因為 t_start (e.g., tensor([481])) 是可疊代的
+        noisy_latent = scheduler.add_noise(latent, noise, t_start) 
         
         # c. (已移至迴圈外)
 
