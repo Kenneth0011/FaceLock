@@ -1,3 +1,4 @@
+print("--- 正在載入已修正的 METHODS.PY v3 (已修復 IndexError) ---")
 import os
 import torch
 import torch.nn as nn
