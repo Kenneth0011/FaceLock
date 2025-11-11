@@ -1,4 +1,3 @@
-print("--- 正在載入已修正的 METHODS.PY v3 (已修復 IndexError) ---")
 import os
 import torch
 import torch.nn as nn
@@ -9,6 +8,9 @@ import torch.nn.functional as F
 import numpy as np
 from utils import compute_score
 import pdb
+
+# --- 正在載入已修正的 METHODS.PY v4 (已修復 IndexError) ---
+# (您可以自行修改這個標記)
 
 # CW L2 attack
 def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
@@ -136,7 +138,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     device = X.device
 
     # 新的模擬超參數
-    SIMULATION_TIMESTEP = 200 # 淨化強度 (t=200 / 1000)
+    # SIMULATION_TIMESTEP = 200 # (已移除 - 這是錯誤的來源)
     SIMULATION_STEPS = 5      # 淨化步數 (S=5)
 
     # 預先計算「無條件嵌入」（空指令）
@@ -146,11 +148,18 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         )
         uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0].to(X.dtype)
 
-    # --- *** 這是錯誤修復 *** ---
-    # 必須 *在迴圈外* *提前* 初始化排程器，
-    # 這樣 `add_noise` 才能找到 `timesteps` 列表。
+    # --- *** 這是錯誤修復 v2 *** ---
+    # 1. 提前初始化排程器
     scheduler.set_timesteps(num_inference_steps=50, device=device)
-    # --- *** 修復結束 *** ---
+    
+    # 2. 不再使用任意的 '200'，而是從排程器中 *合法地* 選取一個起始點
+    #    我們從 50 步的中間點 (索引 25) 開始
+    t_start_index = len(scheduler.timesteps) // 2
+    t_start = scheduler.timesteps[t_start_index] # 獲取 *合法的* 時間步 (例如 481)
+    
+    # 3. 獲取我們要運行的 S 步
+    timesteps_to_run = scheduler.timesteps[t_start_index : t_start_index + SIMULATION_STEPS]
+    # --- *** 修復結束 v2 *** ---
 
     # --- (END NEW PREPARATION) ---
 
@@ -177,15 +186,10 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
 
         # b. 添加噪聲 (模擬淨化的起始點)
         noise = torch.randn_like(latent)
-        t_start = torch.tensor([SIMULATION_TIMESTEP], device=device) # 淨化強度
+        # 這一行現在可以安全執行了，因為 t_start (例如 481) 100% 在 scheduler.timesteps 中
+        noisy_latent = scheduler.add_noise(latent, noise, t_start) # t_start 是一個 tensor
         
-        # 這一行現在可以安全執行了
-        noisy_latent = scheduler.add_noise(latent, noise, t_start)
-
-        # c. 獲取要運行的時間步
-        # (我們已經在迴圈外呼叫過 set_timesteps，所以這裡 scheduler.timesteps 是可用的)
-        t_start_index = (scheduler.timesteps - SIMULATION_TIMESTEP).abs().argmin()
-        timesteps_to_run = scheduler.timesteps[t_start_index : t_start_index + SIMULATION_STEPS]
+        # c. (已移至迴圈外)
 
         # d. 執行 S 步去噪迴圈 (模擬淨化)
         simulated_latent = noisy_latent
