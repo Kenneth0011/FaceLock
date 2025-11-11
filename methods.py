@@ -224,7 +224,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         loss_encoder = F.mse_loss(latent, clean_latent) # 'latent' 是未加噪聲的
         loss_lpips = lpips_fn(image, X)
         
-        # G(Loss) 損失函式 (Test 6: 移除預熱, -lpips)
+        # 損失函式 (Test 6: 移除預熱, -lpips)
         loss = -loss_cvl * lambda_cvl + \
                loss_encoder * lambda_encoder - \
                loss_lpips * lambda_lpips
