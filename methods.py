@@ -114,7 +114,7 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
         grad, = torch.autograd.grad(loss, [X_adv])
         X_adv = X_adv - grad.detach().sign() * actual_step_size
 
-        pbar.set_description(f"[Running attack]: Loss {loss.item():.5f} | step size: {actual_step_size:.4}")
+        pbar.set_description(f"Running attack]: Loss {loss.item():.5f} | step size: {actual_step_size:.4}")
 
         X_adv = torch.minimum(torch.maximum(X_adv, X - eps), X + eps)
         X_adv.data = torch.clamp(X_adv, min=clamp_min, max=clamp_max)
@@ -150,7 +150,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     pbar = tqdm(range(iters))
     
     X_adv.requires_grad_(True)
-    clean_latent = vae.encode(X).latent_dist.mean
+    clean_latent = vae.encode(X).latent_dist.mean # [1, 4, 64, 64]
 
     # --- 使用我們測試出的最佳參數 (Test 6) ---
     lambda_encoder = 0.0 
@@ -165,7 +165,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         # 這是「微型擴散模擬」
         
         # a. 編碼 (Algorithm 1, line 4)
-        latent = vae.encode(X_adv).latent_dist.mean
+        latent = vae.encode(X_adv).latent_dist.mean # [1, 4, 64, 64]
 
         # b. 添加噪聲 (模擬淨化的起始點)
         noise = torch.randn_like(latent)
@@ -179,13 +179,26 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
 
         # d. 執行 S 步去噪迴圈 (模擬淨化)
         simulated_latent = noisy_latent
+        
+        # *** 這是 InstructPix2Pix 的關鍵 ***
+        # 我們需要 `clean_latent` 作為 U-Net 的額外條件 (4 個通道)
+        image_latent_cond = clean_latent # [1, 4, 64, 64]
+
         with torch.no_grad(): # 我們不需要在模擬內部計算梯度
             for t in timesteps_to_run:
-                latent_model_input = scheduler.scale_model_input(simulated_latent, t)
+                
+                # --- *** 這是錯誤修復 *** ---
+                # 串聯 `simulated_latent` (4 通道) 和 `image_latent_cond` (4 通道)
+                # 得到 U-Net 期望的 8 通道輸入
+                # [1, 4, 64, 64] + [1, 4, 64, 64] -> [1, 8, 64, 64]
+                latent_model_input = torch.cat([simulated_latent, image_latent_cond], dim=1)
+                # --- *** 修復結束 *** ---
+
+                latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
                 # 預測噪聲 (使用空指令)
                 noise_pred = unet(
-                    latent_model_input,
+                    latent_model_input, # 現在這是 8 通道, shape 正確
                     t,
                     encoder_hidden_states=uncond_embeddings
                 ).sample
