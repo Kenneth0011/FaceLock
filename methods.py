@@ -144,6 +144,13 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
             [""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
         )
         uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0].to(X.dtype)
+
+    # --- *** 這是錯誤修復 *** ---
+    # 必須 *在迴圈外* *提前* 初始化排程器，
+    # 這樣 `add_noise` 才能找到 `timesteps` 列表。
+    scheduler.set_timesteps(num_inference_steps=50, device=device)
+    # --- *** 修復結束 *** ---
+
     # --- (END NEW PREPARATION) ---
 
     X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(device), min=clamp_min, max=clamp_max).half()
@@ -170,10 +177,12 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         # b. 添加噪聲 (模擬淨化的起始點)
         noise = torch.randn_like(latent)
         t_start = torch.tensor([SIMULATION_TIMESTEP], device=device) # 淨化強度
+        
+        # 這一行現在可以安全執行了
         noisy_latent = scheduler.add_noise(latent, noise, t_start)
 
         # c. 獲取要運行的時間步
-        scheduler.set_timesteps(num_inference_steps=50) # 我們使用一個標準的 50 步排程器
+        # (我們已經在迴圈外呼叫過 set_timesteps，所以這裡 scheduler.timesteps 是可用的)
         t_start_index = (scheduler.timesteps - SIMULATION_TIMESTEP).abs().argmin()
         timesteps_to_run = scheduler.timesteps[t_start_index : t_start_index + SIMULATION_STEPS]
 
@@ -215,7 +224,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         loss_encoder = F.mse_loss(latent, clean_latent) # 'latent' 是未加噪聲的
         loss_lpips = lpips_fn(image, X)
         
-        # 損失函式 (Test 6: 移除預熱, -lpips)
+        # G(Loss) 損失函式 (Test 6: 移除預熱, -lpips)
         loss = -loss_cvl * lambda_cvl + \
                loss_encoder * lambda_encoder - \
                loss_lpips * lambda_lpips
