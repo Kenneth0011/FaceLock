@@ -122,39 +122,91 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
     return X_adv
 
+# --- 這是「方向一」優化後的 FACELOCK ---
 def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1):
-    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device), min=clamp_min, max=clamp_max).half()
+    
+    # --- 1. PREPARATION (NEW) ---
+    # 從管線中獲取所有組件
+    vae = model.vae
+    unet = model.unet
+    scheduler = model.scheduler
+    tokenizer = model.tokenizer
+    text_encoder = model.text_encoder
+    device = X.device
+
+    # 新的模擬超參數
+    SIMULATION_TIMESTEP = 200 # 淨化強度 (t=200 / 1000)
+    SIMULATION_STEPS = 5      # 淨化步數 (S=5)
+
+    # 預先計算「無條件嵌入」（空指令）
+    with torch.no_grad():
+        uncond_input = tokenizer(
+            [""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
+        )
+        uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0].to(X.dtype)
+    # --- (END NEW PREPARATION) ---
+
+    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(device), min=clamp_min, max=clamp_max).half()
     pbar = tqdm(range(iters))
     
-    vae = model.vae
     X_adv.requires_grad_(True)
     clean_latent = vae.encode(X).latent_dist.mean
 
-    # --- 權重調整 ---
-    lambda_encoder = 0.0 # 完全移除衝突項
-    lambda_cvl = 3.0   # 臉部辨識損失權重 (高攻擊)
-    lambda_lpips = 3.0 # 特徵差異損失權重 (高優先級保持視覺相似)
-    # ------------------
+    # --- 使用我們測試出的最佳參數 (Test 6) ---
+    lambda_encoder = 0.0 
+    lambda_cvl = 2.0   
+    lambda_lpips = 2.0 
+    # ---
 
     for i in pbar:
-        # actual_step_size = step_size
         actual_step_size = step_size - (step_size - step_size / 100) / iters * i
         
+        # --- 2. REPLACING STEP 1 (VAE SIMULATION) ---
+        # 這是「微型擴散模擬」
+        
+        # a. 編碼 (Algorithm 1, line 4)
         latent = vae.encode(X_adv).latent_dist.mean
-        image = vae.decode(latent).sample.clip(-1, 1)
 
+        # b. 添加噪聲 (模擬淨化的起始點)
+        noise = torch.randn_like(latent)
+        t_start = torch.tensor([SIMULATION_TIMESTEP], device=device) # 淨化強度
+        noisy_latent = scheduler.add_noise(latent, noise, t_start)
+
+        # c. 獲取要運行的時間步
+        scheduler.set_timesteps(num_inference_steps=50) # 我們使用一個標準的 50 步排程器
+        t_start_index = (scheduler.timesteps - SIMULATION_TIMESTEP).abs().argmin()
+        timesteps_to_run = scheduler.timesteps[t_start_index : t_start_index + SIMULATION_STEPS]
+
+        # d. 執行 S 步去噪迴圈 (模擬淨化)
+        simulated_latent = noisy_latent
+        with torch.no_grad(): # 我們不需要在模擬內部計算梯度
+            for t in timesteps_to_run:
+                latent_model_input = scheduler.scale_model_input(simulated_latent, t)
+
+                # 預測噪聲 (使用空指令)
+                noise_pred = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=uncond_embeddings
+                ).sample
+
+                # 計算上一步 (去噪)
+                simulated_latent = scheduler.step(noise_pred, t, simulated_latent).prev_sample
+
+        # e. 解碼 (Algorithm 1, line 5 - 但使用 *simulated_latent*)
+        image = vae.decode(simulated_latent).sample.clip(-1, 1)
+        # --- (END OF REPLACEMENT) ---
+
+        # --- 3. COMPUTE LOSSES (在新的 'image' 上計算) ---
         loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
-        loss_encoder = F.mse_loss(latent, clean_latent)
+        loss_encoder = F.mse_loss(latent, clean_latent) # 'latent' 是未加噪聲的
         loss_lpips = lpips_fn(image, X)
         
-        # --- 修正後的損失函式 ---
-        # 1. 還原 loss_lpips 的符號為 + (最小化視覺差異)
-        # 2. 移除預熱排程
-        # 3. 使用 3.0 的權重
+        # 損失函式 (Test 6: 移除預熱, -lpips)
         loss = -loss_cvl * lambda_cvl + \
-               loss_encoder * lambda_encoder + \
+               loss_encoder * lambda_encoder - \
                loss_lpips * lambda_lpips
-        # ------------------------
+        # --- (END OF LOSS COMPUTATION) ---
 
         grad, = torch.autograd.grad(loss, [X_adv])
         X_adv = X_adv + grad.detach().sign() * actual_step_size
