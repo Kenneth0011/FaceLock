@@ -7,14 +7,14 @@ import numpy as np
 from utils import compute_score
 import pdb
 
-# --- Matplotlib 修改 ---
-# 必須在 import pyplot 之前設定後端
+# --- Matplotlib 終極解決方案 ---
+import os
+os.environ['MPLBACKEND'] = 'Agg'  # <-- 關鍵：在 import matplotlib 之前，強制設定環境變數
 import matplotlib
-matplotlib.use('Agg')  # 強制使用 Agg 後端 (用於非互動式儲存圖檔)
 import matplotlib.pyplot as plt
-# -----------------------
+# -----------------------------
 
-# --- 繪圖輔助函數 (修改為存檔) ---
+# --- 繪圖輔助函數 (維持存檔) ---
 def plot_facelock_history(history):
     """
     專門用來繪製 facelock 函數回傳的 history 字典
@@ -60,12 +60,10 @@ def plot_facelock_history(history):
     # 調整排版並儲存圖表
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     
-    # --- ↓↓↓ 修改為存檔 (savefig) 而非顯示 (show) ↓↓↓ ---
     save_path = "facelock_loss_convergence.png"
     plt.savefig(save_path) 
     print(f"Loss plot saved to: {save_path}")
     # plt.show() # 在 Agg 模式下無法運作
-    # ----------------------------------------------------
 # -----------------------------
 
 
