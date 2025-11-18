@@ -193,7 +193,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
         loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
         loss_encoder = F.mse_loss(latent, clean_latent)
         loss_lpips = lpips_fn(image, X)
-        loss = -loss_cvl * (1.5 if i >= iters * 0.35 else 0.0) + loss_encoder *0.5 + loss_lpips * (1.5 if i > iters * 0.25 else 0.0)
+        loss = -loss_cvl * (1 if i >= iters * 0.35 else 0.0) + loss_encoder *0.2 + loss_lpips * (1 if i > iters * 0.25 else 0.0)
         grad, = torch.autograd.grad(loss, [X_adv])
         X_adv = X_adv + grad.detach().sign() * actual_step_size
 
