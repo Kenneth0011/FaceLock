@@ -1,3 +1,4 @@
+%%writefile methods.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,18 +8,16 @@ import cv2
 import dlib
 import os
 from tqdm import tqdm
-import matplotlib
-# 強制設定 matplotlib 後端，避免在無螢幕環境 (如 Kaggle) 報錯
+
+# [FIX] Force backend to Agg BEFORE importing matplotlib to avoid Kaggle backend error
 os.environ['MPLBACKEND'] = 'Agg'
+import matplotlib
 import matplotlib.pyplot as plt
 
-# 假設 utils.py 裡有 compute_score，請確保該檔案存在
 from utils import compute_score
 
 # ==============================================================================
 # 第一部分：傳統攻擊方法 (Legacy Methods)
-# 包含 CW, Encoder Attack, VAE Attack
-# 已更新回傳格式為 (X_adv, history)
 # ==============================================================================
 
 def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
@@ -122,14 +121,10 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 # ==============================================================================
 # 第二部分：FaceLock 攻擊器類別 (FaceLockAttacker)
-# 包含 Mask 生成、優化後的 Facelock 演算法、以及繪圖功能
 # ==============================================================================
 
 class FaceLockAttacker:
     def __init__(self, predictor_path="shape_predictor_68_face_landmarks.dat"):
-        """
-        初始化：載入 Dlib 模型
-        """
         print("[FaceLock] Initializing Dlib detector...")
         self.detector = dlib.get_frontal_face_detector()
         self.has_landmarks = False
@@ -145,14 +140,10 @@ class FaceLockAttacker:
             print(f"[FaceLock] Warning: {predictor_path} not found. Will use bounding box mask (less accurate).")
 
     def get_face_mask(self, image_tensor, pad=15, blur_sigma=15):
-        """
-        生成臉部遮罩 (Soft Mask)
-        image_tensor: (1, 3, H, W)
-        """
         # 轉為 Numpy image (H, W, 3), 範圍 [0, 255]
         img_np = image_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
         
-        # 處理標準化: 假設輸入可能是 [-1, 1] 或 [0, 1]
+        # 處理標準化
         if img_np.min() < 0:
             img_np = ((img_np + 1) / 2 * 255).astype(np.uint8)
         elif img_np.max() <= 1.0:
@@ -167,14 +158,12 @@ class FaceLockAttacker:
         dets = self.detector(img_np, 1)
         
         if len(dets) == 0:
-            print("[FaceLock] Warning: No face detected! Mask will be empty (no attack applied).")
-            # 回傳全黑 (不攻擊) 或全白 (全攻擊)，這裡設為全白以防萬一，但最好是回傳警告
+            print("[FaceLock] Warning: No face detected! Mask will be empty.")
             return torch.ones_like(image_tensor)
 
-        d = dets[0] # 取第一張臉
+        d = dets[0]
 
         if self.has_landmarks:
-            # 使用 68 特徵點
             shape = self.predictor(img_np, d)
             points = []
             for i in range(68):
@@ -183,16 +172,14 @@ class FaceLockAttacker:
             hull = cv2.convexHull(np.array(points))
             cv2.fillConvexPoly(mask, hull, 1.0)
         else:
-            # 備用方案：方框
             x1, y1, x2, y2 = d.left(), d.top(), d.right(), d.bottom()
             mask[y1:y2, x1:x2] = 1.0
 
-        # 處理遮罩邊緣 (Dilation + Gaussian Blur)
+        # 處理遮罩邊緣
         kernel = np.ones((pad, pad), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=1)
         mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=blur_sigma)
         
-        # 轉回 Tensor 並送到 GPU
         mask_tensor = torch.from_numpy(mask).view(1, 1, H, W).repeat(1, 3, 1, 1)
         mask_tensor = mask_tensor.to(image_tensor.device)
         
@@ -201,15 +188,9 @@ class FaceLockAttacker:
     def attack(self, X, model, aligner, fr_model, lpips_fn, 
                eps=0.03, step_size=0.01, iters=100, 
                clamp_min=-1, clamp_max=1, plot_history=False):
-        """
-        執行 Facelock 攻擊 (Optimized + Masked)
-        """
-        # 1. 自動生成 Mask
-        mask = self.get_face_mask(X)
         
-        # 2. 初始化攻擊圖像 (只在 Mask 區域加噪聲)
+        mask = self.get_face_mask(X)
         noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
-        # 初始只在臉上加噪聲
         X_adv = X.clone().detach() + noise * mask
         X_adv = torch.clamp(X_adv, min=clamp_min, max=clamp_max).half()
 
@@ -227,54 +208,35 @@ class FaceLockAttacker:
             
             X_adv.requires_grad_(True)
             
-            # --- Forward Pass ---
             latent = vae.encode(X_adv).latent_dist.mean
             image = vae.decode(latent).sample.clip(clamp_min, clamp_max)
 
-            # --- Loss 計算 (Minimize All Strategy) ---
-            # loss_cvl: 我們希望 Similarity 越低越好。
-            # 但 PGD 通常是 Minimize Loss。
-            # 如果 compute_score 回傳的是 Cosine Similarity (數值越大越像)，
-            # 我們應該 Minimize (Similarity)。
-            # 注意：請確認 utils.py 裡的 compute_score 是否回傳 Cosine Similarity。
             loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
-            
-            # loss_encoder & lpips: 我們希望越像越好 -> Minimize MSE
             loss_encoder = F.mse_loss(latent, clean_latent)
             loss_lpips = lpips_fn(image, X)
 
-            # 權重排程 (Scheduler)
             w_cvl = 2.0 if i >= iters * 0.35 else 0.0
             w_lpips = 1.0 if i > iters * 0.25 else 0.0
             w_enc = 0.2
 
-            # 總 Loss
             loss = loss_cvl * w_cvl + loss_encoder * w_enc + loss_lpips * w_lpips
             
-            # --- Backward Pass ---
             grad, = torch.autograd.grad(loss, [X_adv])
-            
-            # [關鍵] 梯度 Masking: 只攻擊臉部，背景梯度歸零
             grad = grad * mask 
 
-            # --- Update (Momentum + Gradient Descent) ---
             grad_norm = torch.norm(grad, p=1)
             grad = grad / (grad_norm + 1e-10)
             momentum = momentum + grad
             
-            # 使用減法 (Gradient Descent) 來最小化 Loss
             X_adv = X_adv - momentum.sign() * actual_step_size
 
-            # --- Projection ---
             delta = torch.clamp(X_adv - X, min=-eps, max=eps)
             X_adv = torch.clamp(X + delta, min=clamp_min, max=clamp_max)
             
-            # [關鍵] 強制還原背景像素 (雙重保險)
             X_adv.data = X_adv.data * mask + X.data * (1 - mask)
             
             X_adv = X_adv.detach()
 
-            # 記錄
             pbar.set_postfix(cvl=loss_cvl.item(), total=loss.item())
             history['total_loss'].append(loss.item())
             history['loss_cvl'].append(loss_cvl.item())
@@ -287,9 +249,6 @@ class FaceLockAttacker:
         return X_adv, history
 
     def _plot_history(self, history):
-        """
-        繪製 Loss 曲線圖並存檔
-        """
         print("Plotting losses...")
         plt.figure(figsize=(12, 10))
         plt.suptitle('FaceLock Loss Convergence (Optimized)', fontsize=16)
@@ -301,17 +260,17 @@ class FaceLockAttacker:
 
         plt.subplot(2, 2, 2)
         plt.plot(history['loss_cvl'], color='red')
-        plt.title('Face Recog Score (Minimize)')
+        plt.title('Face Recog Score')
         plt.grid(True)
 
         plt.subplot(2, 2, 3)
         plt.plot(history['loss_encoder'], color='green')
-        plt.title('Encoder MSE (Minimize)')
+        plt.title('Encoder MSE')
         plt.grid(True)
 
         plt.subplot(2, 2, 4)
         plt.plot(history['loss_lpips'], color='purple')
-        plt.title('LPIPS Loss (Minimize)')
+        plt.title('LPIPS Loss')
         plt.grid(True)
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
