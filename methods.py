@@ -232,7 +232,7 @@ class FaceLockAttacker:
             loss_lpips = lpips_fn(image, X)
 
             # 激進權重
-            w_cvl = 1.0  
+            w_cvl = 2.0  
             w_lpips = 1.0 
             w_enc = 0.2   
 
