@@ -106,8 +106,37 @@ def process_facelock(X, model, args):
     with torch.autocast("cuda"):
         # Instantiate the Attacker Class
         attacker = FaceLockAttacker(predictor_path=args.dlib_path)
+
+        # ============================================================
+        # --- [新增] Mask 可視化區塊 ---
+        # ============================================================
+        print("[Defend] Generating visualization mask...")
+        # 這裡必須使用與 methods.py 中 attack 函數相同的參數 (pad=50, blur=20)
+        # 才能看到真正被使用的 Mask
+        mask_tensor = attacker.get_face_mask(X, pad=50, blur_sigma=20)
         
-        # Run Attack
+        # 將 Tensor (0.0~1.0) 轉換為 NumPy 圖片格式 (0~255)
+        mask_np = mask_tensor.squeeze().cpu().permute(1, 2, 0).numpy()
+        mask_img_np = (mask_np * 255).astype(np.uint8)
+        
+        # 確保是 RGB 格式以便存檔
+        if mask_img_np.shape[2] == 1:
+             mask_img_np = np.repeat(mask_img_np, 3, axis=2)
+
+        mask_pil = Image.fromarray(mask_img_np)
+
+        # 決定儲存路徑 (存到跟 output_path 同一個資料夾下)
+        base_dir = os.path.dirname(args.output_path) if args.output_path else "."
+        # 如果 output_path 是純檔名，base_dir 會是空字串，修正為當前目錄
+        if not base_dir: base_dir = "."
+            
+        mask_save_path = os.path.join(base_dir, "visualized_mask.png")
+        mask_pil.save(mask_save_path)
+        print(f"[Defend] Mask visualization saved to: {mask_save_path}")
+        # ============================================================
+
+
+        # Run Attack (正常執行攻擊)
         X_adv, history = attacker.attack(
             X=X,
             model=model,
