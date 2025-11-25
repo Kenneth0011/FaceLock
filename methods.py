@@ -8,11 +8,13 @@ import dlib
 import os
 from tqdm import tqdm
 
-# [FIX] Force backend to Agg BEFORE importing matplotlib to avoid Kaggle backend error
+# [重要] 強制將 Matplotlib 後端設為 Agg，避免在 Kaggle/無螢幕環境下報錯
+# 這行必須在 import matplotlib 之前執行
 os.environ['MPLBACKEND'] = 'Agg'
 import matplotlib
 import matplotlib.pyplot as plt
 
+# 假設 utils.py 已經存在並包含 compute_score
 from utils import compute_score
 
 # ==============================================================================
@@ -120,6 +122,10 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 # ==============================================================================
 # 第二部分：FaceLock 攻擊器類別 (FaceLockAttacker)
+# 包含：
+# 1. 擴大的遮罩邏輯 (額頭延伸 + Dilation)
+# 2. Gradient Descent 優化
+# 3. 梯度 Masking 保護背景
 # ==============================================================================
 
 class FaceLockAttacker:
@@ -138,7 +144,12 @@ class FaceLockAttacker:
         else:
             print(f"[FaceLock] Warning: {predictor_path} not found. Will use bounding box mask (less accurate).")
 
-    def get_face_mask(self, image_tensor, pad=15, blur_sigma=15):
+    def get_face_mask(self, image_tensor, pad=50, blur_sigma=20):
+        """
+        生成擴大的臉部遮罩。
+        pad: 擴張像素量 (預設 50，覆蓋額頭與邊緣)
+        blur_sigma: 邊緣模糊程度 (預設 20，平滑過渡)
+        """
         # 轉為 Numpy image (H, W, 3), 範圍 [0, 255]
         img_np = image_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
         
@@ -153,12 +164,11 @@ class FaceLockAttacker:
         H, W = img_np.shape[:2]
         mask = np.zeros((H, W), dtype=np.float32)
         
-        # 偵測人臉
         dets = self.detector(img_np, 1)
         
         if len(dets) == 0:
             print("[FaceLock] Warning: No face detected! Mask will be empty.")
-            return torch.ones_like(image_tensor)
+            return torch.ones_like(image_tensor) # 無法偵測時，預設攻擊全圖或不攻擊(視需求)
 
         d = dets[0]
 
@@ -168,17 +178,40 @@ class FaceLockAttacker:
             for i in range(68):
                 points.append((shape.part(i).x, shape.part(i).y))
             
+            # --- 手動向上延伸以覆蓋額頭 (Forehead Extension) ---
+            # 利用眉毛和鼻子的距離來估算額頭高度
+            eyebrow_y_min = min(shape.part(19).y, shape.part(24).y) # 眉毛最高點
+            nose_y = shape.part(27).y # 鼻樑點
+            
+            # 估算額頭高度 (通常是眉毛到鼻子距離的 1.5 倍左右)
+            forehead_height = int(abs(nose_y - eyebrow_y_min) * 1.5)
+            
+            # 取得臉部最左和最右的 X 座標 (大約是臉頰寬度)
+            face_left_x = shape.part(0).x
+            face_right_x = shape.part(16).x
+            
+            # 加入額頭頂部的兩個點 (左上, 右上)
+            points.append((face_left_x, eyebrow_y_min - forehead_height))
+            points.append((face_right_x, eyebrow_y_min - forehead_height))
+            # ------------------------------------------------
+            
             hull = cv2.convexHull(np.array(points))
             cv2.fillConvexPoly(mask, hull, 1.0)
         else:
+            # 備用方案：方框，並手動往上擴大
             x1, y1, x2, y2 = d.left(), d.top(), d.right(), d.bottom()
-            mask[y1:y2, x1:x2] = 1.0
+            # 往上延伸 pad 距離
+            y1_extended = max(0, y1 - pad)
+            mask[y1_extended:y2, x1:x2] = 1.0
 
-        # 處理遮罩邊緣
+        # --- 擴大遮罩 (Dilation) ---
         kernel = np.ones((pad, pad), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=1)
+        
+        # --- 邊緣模糊 (Blur) ---
         mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=blur_sigma)
         
+        # 轉回 Tensor
         mask_tensor = torch.from_numpy(mask).view(1, 1, H, W).repeat(1, 3, 1, 1)
         mask_tensor = mask_tensor.to(image_tensor.device)
         
@@ -188,7 +221,10 @@ class FaceLockAttacker:
                eps=0.03, step_size=0.01, iters=100, 
                clamp_min=-1, clamp_max=1, plot_history=False):
         
-        mask = self.get_face_mask(X)
+        # 1. 生成遮罩 (預設使用較大的 pad=50 以覆蓋額頭)
+        mask = self.get_face_mask(X, pad=50, blur_sigma=20)
+        
+        # 2. 初始化攻擊圖像 (只在 Mask 區域加噪聲)
         noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
         X_adv = X.clone().detach() + noise * mask
         X_adv = torch.clamp(X_adv, min=clamp_min, max=clamp_max).half()
@@ -199,7 +235,7 @@ class FaceLockAttacker:
         
         history = {'total_loss': [], 'loss_cvl': [], 'loss_encoder': [], 'loss_lpips': []}
         
-        print(f"[FaceLock] Starting attack ({iters} iters)...")
+        print(f"[FaceLock] Starting attack ({iters} iters) with DILATED MASK...")
         pbar = tqdm(range(iters))
 
         for i in pbar:
@@ -207,31 +243,44 @@ class FaceLockAttacker:
             
             X_adv.requires_grad_(True)
             
+            # --- Forward ---
             latent = vae.encode(X_adv).latent_dist.mean
             image = vae.decode(latent).sample.clip(clamp_min, clamp_max)
 
+            # --- Loss Calculation ---
+            # loss_cvl: Minimize Similarity (讓越不像越好)
             loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
+            
+            # loss_encoder & lpips: Minimize Distortion (讓畫質/結構越像越好)
             loss_encoder = F.mse_loss(latent, clean_latent)
             loss_lpips = lpips_fn(image, X)
 
+            # 權重排程
             w_cvl = 2.0 if i >= iters * 0.35 else 0.0
             w_lpips = 1.0 if i > iters * 0.25 else 0.0
             w_enc = 0.2
 
             loss = loss_cvl * w_cvl + loss_encoder * w_enc + loss_lpips * w_lpips
             
+            # --- Backward ---
             grad, = torch.autograd.grad(loss, [X_adv])
+            
+            # [關鍵] 梯度 Masking: 只保留 Mask 區域的梯度
             grad = grad * mask 
 
+            # --- Update (Momentum + Gradient Descent) ---
             grad_norm = torch.norm(grad, p=1)
             grad = grad / (grad_norm + 1e-10)
             momentum = momentum + grad
             
+            # 使用減法 (Gradient Descent) 來最小化 Loss
             X_adv = X_adv - momentum.sign() * actual_step_size
 
+            # --- Projection ---
             delta = torch.clamp(X_adv - X, min=-eps, max=eps)
             X_adv = torch.clamp(X + delta, min=clamp_min, max=clamp_max)
             
+            # [關鍵] 雙重保險：強制還原背景像素
             X_adv.data = X_adv.data * mask + X.data * (1 - mask)
             
             X_adv = X_adv.detach()
@@ -259,17 +308,17 @@ class FaceLockAttacker:
 
         plt.subplot(2, 2, 2)
         plt.plot(history['loss_cvl'], color='red')
-        plt.title('Face Recog Score')
+        plt.title('Face Recog Score (Minimize)')
         plt.grid(True)
 
         plt.subplot(2, 2, 3)
         plt.plot(history['loss_encoder'], color='green')
-        plt.title('Encoder MSE')
+        plt.title('Encoder MSE (Minimize)')
         plt.grid(True)
 
         plt.subplot(2, 2, 4)
         plt.plot(history['loss_lpips'], color='purple')
-        plt.title('LPIPS Loss')
+        plt.title('LPIPS Loss (Minimize)')
         plt.grid(True)
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
