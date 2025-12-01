@@ -19,7 +19,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 # ==============================================================================
-# 1. 輔助功能：遮罩生成、邊緣提取、繪圖
+# 1. 輔助功能
 # ==============================================================================
 
 _dlib_detector = None
@@ -38,7 +38,6 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     else:
         img_np = img_np.numpy()
     
-    # 轉為 0-255 uint8
     if img_np.min() < 0:
         img_np = ((img_np + 1) / 2 * 255).astype(np.uint8)
     elif img_np.max() <= 1.0:
@@ -81,22 +80,15 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
 
 def get_edge_mask(mask_tensor, thickness=15):
     """
-    [新增] 從 Face Mask 提取邊緣區域 (甜甜圈形狀)
+    從 Face Mask 提取邊緣區域
     """
     mask_np = mask_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
-    mask_np = mask_np[:, :, 0] # 取單通道
+    mask_np = mask_np[:, :, 0] 
     
     kernel = np.ones((thickness, thickness), np.uint8)
-    
-    # 膨脹 (變胖)
     dilated = cv2.dilate(mask_np, kernel, iterations=1)
-    # 腐蝕 (變瘦)
     eroded = cv2.erode(mask_np, kernel, iterations=1)
-    
-    # 相減得到邊緣
     edge = dilated - eroded
-    
-    # 稍微模糊邊緣
     edge = cv2.GaussianBlur(edge, (5, 5), 0)
     
     edge_tensor = torch.from_numpy(edge).to(mask_tensor.device)
@@ -105,7 +97,7 @@ def get_edge_mask(mask_tensor, thickness=15):
 
 def save_mask_check(image_tensor, mask_tensor, edge_mask_tensor, save_path="facelock_mask_check.png"):
     """
-    [更新] 顯示原圖、臉部遮罩、以及攻擊重點(邊緣)
+    顯示檢查圖
     """
     print(f"Saving mask visualization to {save_path}...")
     
@@ -133,21 +125,18 @@ def save_mask_check(image_tensor, mask_tensor, edge_mask_tensor, save_path="face
     plt.title("Boundary Area (Blur Attack)", y=1.02)
     plt.axis('off')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95]) # 修正標題被切掉的問題
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(save_path)
     plt.close()
 
 def plot_loss_history(history, save_path="facelock_loss_convergence.png"):
-    """
-    [更新] 繪製新的 Loss 曲線 (Boundary & Texture)
-    """
     print(f"Plotting losses to {save_path}...")
     plt.figure(figsize=(12, 10))
     plt.suptitle('Anti-Inpainting Loss Convergence', fontsize=16)
 
     plt.subplot(2, 2, 1); plt.plot(history['total_loss']); plt.title('Total Loss'); plt.grid(True)
-    plt.subplot(2, 2, 2); plt.plot(history['loss_boundary'], color='orange'); plt.title('Boundary Disruption (Lower is Better)'); plt.grid(True)
-    plt.subplot(2, 2, 3); plt.plot(history['loss_texture'], color='green'); plt.title('Texture Disruption (Lower is Better)'); plt.grid(True)
+    plt.subplot(2, 2, 2); plt.plot(history['loss_boundary'], color='orange'); plt.title('Boundary Disruption'); plt.grid(True)
+    plt.subplot(2, 2, 3); plt.plot(history['loss_texture'], color='green'); plt.title('Texture Disruption'); plt.grid(True)
     plt.subplot(2, 2, 4); plt.plot(history['loss_lpips'], color='purple'); plt.title('Visual Similarity (LPIPS)'); plt.grid(True)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
@@ -155,54 +144,50 @@ def plot_loss_history(history, save_path="facelock_loss_convergence.png"):
     plt.close()
 
 # ==============================================================================
-# 2. 抗編輯攻擊主程式 (取代原本的 Facelock 邏輯)
+# 2. 抗編輯攻擊主程式
 # ==============================================================================
 
 def facelock(X, model, aligner, fr_model, lpips_fn, 
              eps=0.03, step_size=0.01, iters=100, 
              clamp_min=-1, clamp_max=1, 
              plot=True):
-    """
-    Anti-Inpainting / Boundary Attack
-    目標：破壞 VAE 在臉部邊緣的特徵，使編輯模型無法正確分割前景背景。
-    """
     
-    # 1. 取得遮罩
-    # face_mask: 臉部區域 (我們要在這裡做輕微的紋理破壞)
-    face_mask = get_face_mask(X, pad=20, blur_sigma=10)
+    # 1. 取得遮罩 (高解析度，用於視覺化)
+    face_mask_hires = get_face_mask(X, pad=20, blur_sigma=10)
+    edge_mask_hires = get_edge_mask(face_mask_hires, thickness=20)
     
-    # edge_mask: 邊緣區域 (我們要在這裡做重度的邊界混淆)
-    edge_mask = get_edge_mask(face_mask, thickness=20)
-    
-    # 組合攻擊遮罩 (視覺化用)
+    # 視覺化檢查 (使用高解析度遮罩)
     if plot:
-        save_mask_check(X, face_mask, edge_mask, save_path="facelock_mask_check.png")
+        save_mask_check(X, face_mask_hires, edge_mask_hires, save_path="facelock_mask_check.png")
 
-    # 初始化擾動 (全圖加噪，允許自然過渡)
-    noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
-    X_adv = torch.clamp(X.clone().detach() + noise, min=clamp_min, max=clamp_max).half()
-    
-    # 定義攻擊目標
-    # 1. 邊界目標：我們希望邊界看起來像「雜訊」或「背景」，而不是清晰的線條
-    # 使用隨機高斯雜訊作為邊界的目標
+    # 2. 初始化 VAE 與 Latent
     vae = model.vae
     with torch.no_grad():
+        # 取得 Latent (尺寸通常是原圖的 1/8)
         clean_latent = vae.encode(X).latent_dist.mean.detach()
-        target_boundary_latent = torch.randn_like(clean_latent) * 1.5 # 強度較高的雜訊
         
-        # 2. 紋理目標：臉部內部稍微偏離原圖，但不至於毀容
-        # 使用稍微偏移的 latent 作為目標
+        # [關鍵修正] 縮小 Mask 以符合 Latent 尺寸
+        # Latent shape: (B, 4, H/8, W/8)
+        latent_h, latent_w = clean_latent.shape[-2:]
+        
+        # 使用 interpolate 將 mask 縮小
+        face_mask = F.interpolate(face_mask_hires, size=(latent_h, latent_w), mode='bilinear')
+        edge_mask = F.interpolate(edge_mask_hires, size=(latent_h, latent_w), mode='bilinear')
+        
+        # 設定目標 (Target)
+        target_boundary_latent = torch.randn_like(clean_latent) * 1.5 
         target_texture_latent = clean_latent + torch.randn_like(clean_latent) * 0.5
 
+    # 初始化擾動
+    noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
+    X_adv = torch.clamp(X.clone().detach() + noise, min=clamp_min, max=clamp_max).half()
+    X_adv.requires_grad_(True)
+    
     history = {'total_loss': [], 'loss_boundary': [], 'loss_texture': [], 'loss_lpips': []}
     
     print(f"Starting Anti-Inpainting Attack (iters={iters}, eps={eps})...")
     pbar = tqdm(range(iters), desc="Optimizing")
     
-    X_adv.requires_grad_(True)
-    
-    # 使用 Adam 優化器通常比 PGD 收斂更好 (針對這種 MSE Loss)
-    # 如果效果不好，可以換回 PGD
     optimizer = optim.Adam([X_adv], lr=step_size)
 
     for i in pbar:
@@ -212,40 +197,30 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
 
         # --- Loss 計算 ---
         
-        # 1. Boundary Loss (邊界混淆)
-        # 強迫邊緣區域的 Latent 接近隨機雜訊 --> 破壞語義分割
+        # 1. Boundary Loss (使用縮小後的 mask)
         loss_boundary = F.mse_loss(latent * edge_mask, target_boundary_latent * edge_mask)
         
-        # 2. Texture Loss (紋理破壞)
-        # 強迫臉部內部的 Latent 發生偏移 --> 防止特徵被完美識別
+        # 2. Texture Loss (使用縮小後的 mask)
         loss_texture = F.mse_loss(latent * face_mask, target_texture_latent * face_mask)
         
-        # 3. LPIPS (視覺維持)
-        # 確保攻擊後的圖看起來還是正常的
+        # 3. LPIPS (視覺維持，使用原圖尺寸)
         loss_lpips = lpips_fn(image, X)
         
         # 權重配置
-        w_bound = 20.0  # 最重要：邊界必須爛掉
-        w_tex = 2.0     # 次要：臉部稍微變異
-        w_lpips = 5.0   # 約束：肉眼看不出來
+        w_bound = 20.0 
+        w_tex = 2.0     
+        w_lpips = 5.0   
         
-        # 我們希望 Minimize MSE (接近目標雜訊) 和 Minimize LPIPS (接近原圖)
         loss = loss_boundary * w_bound + loss_texture * w_tex + loss_lpips * w_lpips
         
         optimizer.zero_grad()
         loss.backward()
-        
-        # 如果使用 Adam，直接 step
-        # 如果要嚴格遵守 eps 限制，可以在 step 後做 projection
         optimizer.step()
         
-        # Constraints (Project & Clip)
+        # Constraints
         with torch.no_grad():
             delta = torch.clamp(X_adv - X, min=-eps, max=eps)
             X_adv.data = torch.clamp(X + delta, min=clamp_min, max=clamp_max)
-            # [關鍵] 不再強制還原背景，允許攻擊雜訊擴散
-            # 但我們可以選擇「遠離臉部的背景」還原，保留「臉部周圍」的攻擊
-            # 這裡簡單起見，全圖允許微幅攻擊，這樣效果最好
 
         # 記錄
         history['total_loss'].append(loss.item())
@@ -265,7 +240,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
     return X_adv.detach()
 
 # ==============================================================================
-# 3. 傳統攻擊函數 (Legacy Methods) - 保留以防報錯
+# 3. 傳統攻擊函數 (保留)
 # ==============================================================================
 
 def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
