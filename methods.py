@@ -9,10 +9,18 @@ import cv2
 import dlib
 from tqdm import tqdm
 from utils import compute_score
+import pdb
+
+# =========================================================
+# [修正錯誤關鍵] 強制設定 Matplotlib 後端
+# 這兩行必須放在 import matplotlib 之前！
+# =========================================================
+os.environ['MPLBACKEND'] = 'Agg'
 
 import matplotlib
-matplotlib.use('Agg') # 防止伺服器端報錯
 import matplotlib.pyplot as plt
+
+# ... (以下保持原本的程式碼)
 
 # ==============================================================================
 # 1. 輔助功能：遮罩生成、繪圖、檢查
