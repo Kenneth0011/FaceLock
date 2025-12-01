@@ -26,7 +26,7 @@ _dlib_detector = None
 
 def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     """
-    自動偵測人臉並生成遮罩
+    自動偵測人臉並生成遮罩 (回傳 3 通道，適配 RGB 圖片)
     """
     global _dlib_detector
     if _dlib_detector is None:
@@ -152,27 +152,32 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
              clamp_min=-1, clamp_max=1, 
              plot=True):
     
-    # 1. 取得遮罩 (高解析度，用於視覺化)
+    # 1. 取得遮罩 (高解析度，3通道，用於視覺化)
     face_mask_hires = get_face_mask(X, pad=20, blur_sigma=10)
     edge_mask_hires = get_edge_mask(face_mask_hires, thickness=20)
     
-    # 視覺化檢查 (使用高解析度遮罩)
+    # 視覺化檢查
     if plot:
         save_mask_check(X, face_mask_hires, edge_mask_hires, save_path="facelock_mask_check.png")
 
     # 2. 初始化 VAE 與 Latent
     vae = model.vae
     with torch.no_grad():
-        # 取得 Latent (尺寸通常是原圖的 1/8)
+        # 取得 Latent (尺寸通常是原圖的 1/8, 通道數為 4)
         clean_latent = vae.encode(X).latent_dist.mean.detach()
         
-        # [關鍵修正] 縮小 Mask 以符合 Latent 尺寸
+        # [關鍵修正] 縮小 Mask 並轉為單通道以符合 Latent 結構
         # Latent shape: (B, 4, H/8, W/8)
         latent_h, latent_w = clean_latent.shape[-2:]
         
         # 使用 interpolate 將 mask 縮小
-        face_mask = F.interpolate(face_mask_hires, size=(latent_h, latent_w), mode='bilinear')
-        edge_mask = F.interpolate(edge_mask_hires, size=(latent_h, latent_w), mode='bilinear')
+        face_mask_latent = F.interpolate(face_mask_hires, size=(latent_h, latent_w), mode='bilinear')
+        edge_mask_latent = F.interpolate(edge_mask_hires, size=(latent_h, latent_w), mode='bilinear')
+        
+        # [修正點]：只取第 1 個通道 (變成 [B, 1, H, W])
+        # 這樣 PyTorch 就能自動廣播到 Latent 的 4 個通道
+        face_mask_latent = face_mask_latent[:, 0:1, :, :]
+        edge_mask_latent = edge_mask_latent[:, 0:1, :, :]
         
         # 設定目標 (Target)
         target_boundary_latent = torch.randn_like(clean_latent) * 1.5 
@@ -197,11 +202,11 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
 
         # --- Loss 計算 ---
         
-        # 1. Boundary Loss (使用縮小後的 mask)
-        loss_boundary = F.mse_loss(latent * edge_mask, target_boundary_latent * edge_mask)
+        # 1. Boundary Loss (使用縮小且轉為單通道的 mask)
+        loss_boundary = F.mse_loss(latent * edge_mask_latent, target_boundary_latent * edge_mask_latent)
         
-        # 2. Texture Loss (使用縮小後的 mask)
-        loss_texture = F.mse_loss(latent * face_mask, target_texture_latent * face_mask)
+        # 2. Texture Loss (使用縮小且轉為單通道的 mask)
+        loss_texture = F.mse_loss(latent * face_mask_latent, target_texture_latent * face_mask_latent)
         
         # 3. LPIPS (視覺維持，使用原圖尺寸)
         loss_lpips = lpips_fn(image, X)
