@@ -10,23 +10,19 @@ import dlib
 from tqdm import tqdm
 from utils import compute_score
 
-# [新增] 引入 matplotlib 用於繪圖
 import matplotlib
-# 強制使用 Agg 後端，防止在沒有螢幕的伺服器上報錯
-matplotlib.use('Agg') 
+matplotlib.use('Agg') # 防止伺服器端報錯
 import matplotlib.pyplot as plt
 
-import pdb
-
 # ==============================================================================
-# 1. 輔助功能：自動生成人臉遮罩 & 繪圖
+# 1. 輔助功能：遮罩生成、繪圖、檢查
 # ==============================================================================
 
 _dlib_detector = None
 
 def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     """
-    自動偵測人臉並生成遮罩 (與上一版相同)
+    自動偵測人臉並生成遮罩
     """
     global _dlib_detector
     if _dlib_detector is None:
@@ -36,6 +32,7 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     if img_np.dim() == 3:
         img_np = img_np.permute(1, 2, 0).numpy()
     
+    # 轉為 0-255 uint8
     if img_np.min() < 0:
         img_np = ((img_np + 1) / 2 * 255).astype(np.uint8)
     elif img_np.max() <= 1.0:
@@ -76,66 +73,103 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     mask_tensor = mask_tensor.repeat(1, 3, 1, 1)
     return mask_tensor
 
+def save_mask_check(image_tensor, mask_tensor, save_path="facelock_mask_check.png"):
+    """
+    [新增] 儲存遮罩檢查圖
+    將原圖、遮罩、與遮罩後的圖畫在一起，方便檢查
+    """
+    print(f"Saving mask visualization to {save_path}...")
+    
+    # 處理原圖 (Tensor -> Numpy, -1~1 -> 0~1)
+    img = image_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    if img.min() < 0:
+        img = (img + 1) / 2
+    img = np.clip(img, 0, 1)
+
+    # 處理遮罩 (Tensor -> Numpy)
+    mask = mask_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    # 遮罩通常是3通道一樣的，取第一個通道顯示即可
+    mask_display = mask[:, :, 0] 
+
+    # 處理疊加圖 (顯示攻擊區域)
+    masked_img = img * mask
+
+    plt.figure(figsize=(15, 5))
+    
+    # 1. 原圖
+    plt.subplot(1, 3, 1)
+    plt.imshow(img)
+    plt.title("Original Image")
+    plt.axis('off')
+
+    # 2. 遮罩 (黑白)
+    plt.subplot(1, 3, 2)
+    plt.imshow(mask_display, cmap='gray')
+    plt.title("Generated Mask (White=Attack)")
+    plt.axis('off')
+
+    # 3. 攻擊區域預覽
+    plt.subplot(1, 3, 3)
+    plt.imshow(masked_img)
+    plt.title("Attack Area Overlay")
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 def plot_loss_history(history, save_path="facelock_loss_convergence.png"):
     """
-    [新增] 繪製 Loss 曲線圖
+    繪製 Loss 曲線圖
     """
     print(f"Plotting losses to {save_path}...")
     plt.figure(figsize=(12, 10))
     plt.suptitle('FaceLock Loss Convergence', fontsize=16)
 
-    # 1. Total Loss
     plt.subplot(2, 2, 1)
     plt.plot(history['total_loss'])
     plt.title('Total Loss')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
     plt.grid(True)
 
-    # 2. Face Recognition Score
     plt.subplot(2, 2, 2)
     plt.plot(history['loss_cvl'], color='red')
     plt.title('Face Recognition Score (loss_cvl)')
-    plt.xlabel('Iteration')
-    plt.ylabel('Score (Lower is better for attack)')
     plt.grid(True)
 
-    # 3. Encoder MSE
     plt.subplot(2, 2, 3)
     plt.plot(history['loss_encoder'], color='green')
     plt.title('Encoder MSE Loss (loss_encoder)')
-    plt.xlabel('Iteration')
     plt.grid(True)
 
-    # 4. LPIPS
     plt.subplot(2, 2, 4)
     plt.plot(history['loss_lpips'], color='purple')
     plt.title('Perceptual Similarity (loss_lpips)')
-    plt.xlabel('Iteration')
     plt.grid(True)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(save_path)
     plt.close()
-    print("Plot saved.")
 
 # ==============================================================================
-# 2. FaceLock 主程式 (整合記錄功能)
+# 2. FaceLock 主程式
 # ==============================================================================
 
 def facelock(X, model, aligner, fr_model, lpips_fn, 
              eps=0.03, step_size=0.01, iters=100, 
              clamp_min=-1, clamp_max=1, 
-             plot=True): # [新增] plot 參數控制是否繪圖
+             plot=True): # plot=True 會同時輸出 Loss圖 和 Mask檢查圖
     
     # 1. 取得遮罩
     mask = get_face_mask(X, pad=30, blur_sigma=15)
     
+    # [新增] 如果開啟繪圖，這裡直接輸出遮罩檢查圖
+    if plot:
+        save_mask_check(X, mask, save_path="facelock_mask_check.png")
+
     # 初始化
     noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
     X_adv = torch.clamp(X.clone().detach() + noise * mask, min=clamp_min, max=clamp_max).half()
     
-    # [新增] 初始化 History 字典
     history = {'total_loss': [], 'loss_cvl': [], 'loss_encoder': [], 'loss_lpips': []}
     
     pbar = tqdm(range(iters), desc="FaceLock (Masked)")
@@ -168,7 +202,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
         X_adv.data = X_adv.data * mask + X.data * (1 - mask)
         X_adv.grad = None
 
-        # [新增] 記錄數據
         history['total_loss'].append(loss.item())
         history['loss_cvl'].append(loss_cvl.item())
         history['loss_encoder'].append(loss_encoder.item())
@@ -180,7 +213,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
             loss=f"{loss.item():.3f}"
         )
     
-    # [新增] 攻擊結束後繪圖
     if plot:
         plot_loss_history(history)
 
