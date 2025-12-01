@@ -12,7 +12,7 @@ from utils import compute_score
 import pdb
 
 # =========================================================
-# [修正錯誤] 強制設定 Matplotlib 後端 (必須在 import matplotlib 之前)
+# 強制設定 Matplotlib 後端 (必須在 import matplotlib 之前)
 # =========================================================
 os.environ['MPLBACKEND'] = 'Agg'
 import matplotlib
@@ -32,9 +32,12 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
     if _dlib_detector is None:
         _dlib_detector = dlib.get_frontal_face_detector()
 
-    img_np = image_tensor.detach().cpu().squeeze()
+    # 這裡加上 .float() 確保轉換為 numpy 時不會出錯，雖然下面會轉 uint8
+    img_np = image_tensor.detach().cpu().squeeze().float()
     if img_np.dim() == 3:
         img_np = img_np.permute(1, 2, 0).numpy()
+    else:
+        img_np = img_np.numpy()
     
     # 轉為 0-255 uint8
     if img_np.min() < 0:
@@ -83,16 +86,21 @@ def get_face_mask(image_tensor, pad=20, blur_sigma=15):
 
 def save_mask_check(image_tensor, mask_tensor, save_path="facelock_mask_check.png"):
     """
-    儲存遮罩檢查圖
+    [修正] 儲存遮罩檢查圖
+    加入 .float() 以解決 matplotlib 不支援 float16 的問題
     """
     print(f"Saving mask visualization to {save_path}...")
     
-    img = image_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    # [修正點 1] 加上 .float() 強制轉為 float32
+    img = image_tensor.detach().cpu().squeeze().permute(1, 2, 0).float().numpy()
+    
     if img.min() < 0:
         img = (img + 1) / 2
     img = np.clip(img, 0, 1)
 
-    mask = mask_tensor.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    # [修正點 2] 加上 .float()
+    mask = mask_tensor.detach().cpu().squeeze().permute(1, 2, 0).float().numpy()
+    
     mask_display = mask[:, :, 0] 
     masked_img = img * mask
 
@@ -190,7 +198,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn,
     return X_adv
 
 # ==============================================================================
-# 3. 傳統攻擊函數 (Legacy Methods) - 必須保留以防報錯
+# 3. 傳統攻擊函數 (Legacy Methods)
 # ==============================================================================
 
 def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
