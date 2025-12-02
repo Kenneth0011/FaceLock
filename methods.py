@@ -201,13 +201,35 @@ class FaceLockAttacker:
 
     def attack(self, X, model, aligner, fr_model, lpips_fn, 
                eps=0.03, step_size=0.01, iters=100, 
-               clamp_min=-1, clamp_max=1, plot_history=False):
+               clamp_min=-1, clamp_max=1, plot_history=False, 
+               save_mask=True): # <--- [NEW] 新增一個參數控制是否存 Mask
 
+        # 1. 生成遮罩
         mask = self.get_face_mask(X, pad=50, blur_sigma=20)
+        
+        # =========================================================
+        # [NEW] 輸出 Mask 圖片的程式碼
+        # =========================================================
+        if save_mask:
+            # mask 是 (1, 3, H, W) 的 Tensor，數值在 0~1 之間
+            # 我們只需要取單一通道 (Grayscale) 來看即可
+            mask_vis = mask[0, 0].detach().cpu().numpy()
+            
+            # 轉換為 0-255 的整數格式
+            mask_vis = (mask_vis * 255).astype(np.uint8)
+            
+            # 儲存圖片
+            mask_filename = "facelock_mask_debug.png"
+            cv2.imwrite(mask_filename, mask_vis)
+            print(f"[FaceLock] Mask image saved to: {mask_filename}")
+        # =========================================================
+
         noise = (torch.rand(*X.shape) * 2 * eps - eps).to(X.device)
         X_adv = X.clone().detach() + noise * mask
         X_adv = torch.clamp(X_adv, min=clamp_min, max=clamp_max).half()
-
+        
+        # ... (以下程式碼保持不變) ...
+        
         vae = model.vae
         clean_latent = vae.encode(X).latent_dist.mean.detach()
         momentum = torch.zeros_like(X_adv).detach()
@@ -218,6 +240,7 @@ class FaceLockAttacker:
         pbar = tqdm(range(iters))
 
         for i in pbar:
+            # ... (迴圈內容保持不變) ...
             actual_step_size = step_size - (step_size - step_size / 100) / iters * i
             X_adv.requires_grad_(True)
 
@@ -232,11 +255,9 @@ class FaceLockAttacker:
             loss_lpips = lpips_fn(image, X)
 
             # 激進權重
-            w_cvl = 2.0  
-            w_lpips = 1.0 
-            w_cvl = 5.0  
+            w_cvl = 5.0   
             w_lpips = 2.0 
-            w_enc = 0.2   
+            w_enc = 0.2    
 
             loss = loss_cvl * w_cvl + loss_encoder * w_enc + loss_lpips * w_lpips
 
@@ -262,7 +283,6 @@ class FaceLockAttacker:
             self._plot_history(history)
 
         return X_adv, history
-
     def _plot_history(self, history):
         """
         繪製 Loss 曲線圖，標題與格式完全依照使用者要求
