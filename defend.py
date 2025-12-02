@@ -5,140 +5,187 @@ import numpy as np
 import torch
 import torchvision
 import lpips
-import pdb
-
-# 引入 Hugging Face Diffusers
 from diffusers import StableDiffusionInstructPix2PixPipeline, StableDiffusionImg2ImgPipeline, EulerAncestralDiscreteScheduler
 
-# 引入本地模組
+# 假設 utils.py 已經存在
 from utils import load_model_by_repo_id, pil_to_input
-# 確保 methods.py 是最新版 (Anti-Inpainting 版本)
-from methods import cw_l2_attack, vae_attack, encoder_attack, facelock
+
+# 引入 methods.py 裡的攻擊方法與 FaceLockAttacker 類別
+from methods import cw_l2_attack, vae_attack, encoder_attack, FaceLockAttacker 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser(description="Image Defense Script")
+    parser = argparse.ArgumentParser()
 
     # 1. Image arguments
-    parser.add_argument("--input_path", required=True, type=str, help="Path to the image you hope to protect")
+    parser.add_argument("--input_path", required=True, type=str, help="path to the input image")
 
     # 2. Target model arguments
-    parser.add_argument("--target_model", default="instruct-pix2pix", type=str, help="Target model: [instruct-pix2pix/stable-diffusion]")
-    parser.add_argument("--model_id", default="timbrooks/instruct-pix2pix", type=str, help="Hugging Face model ID")
-    
-    # 3. Attack (Defense) arguments
-    parser.add_argument("--defend_method", required=True, type=str, help="Method: [encoder/vae/cw/facelock]")
-    parser.add_argument("--attack_budget", default=0.03, type=float, help="Attack budget (epsilon)")
-    parser.add_argument("--step_size", default=0.01, type=float, help="Attack step size")
-    parser.add_argument("--num_iters", default=100, type=int, help="Number of iterations")
-    parser.add_argument("--targeted", default=True, action='store_true', help="Use targeted attack")
-    parser.add_argument("--untargeted", action='store_false', dest='targeted', help="Use untargeted attack")
-    
-    # 繪圖開關
-    parser.add_argument("--plot", action='store_true', help="Enable plotting of loss convergence and mask visualization")
+    parser.add_argument("--target_model", default="instruct-pix2pix", type=str, help="target model [instruct-pix2pix/stable-diffusion]")
+    parser.add_argument("--model_id", default="timbrooks/instruct-pix2pix", type=str, help="huggingface model id")
 
-    # 3.1 CW attack specific arguments
-    parser.add_argument("--c", default=0.03, type=float, help="Constant ratio for CW attack")
-    parser.add_argument("--lr", default=0.03, type=float, help="Learning rate for CW attack")
+    # 3. Attack arguments
+    parser.add_argument("--defend_method", required=True, type=str, help="chosen method [encoder/vae/cw/facelock]")
+    parser.add_argument("--attack_budget", default=0.03, type=float, help="perturbation budget (eps)")
+    parser.add_argument("--step_size", default=0.01, type=float, help="attack step size")
+    parser.add_argument("--num_iters", default=100, type=int, help="number of iterations")
+    parser.add_argument("--targeted", default=True, action='store_true', help="use targeted attack")
+    parser.add_argument("--untargeted", action='store_false', dest='targeted', help="use untargeted attack")
+
+    # 3.1 CW attack arguments
+    parser.add_argument("--c", default=0.03, type=float, help="constant for cw attack")
+    parser.add_argument("--lr", default=0.03, type=float, help="learning rate for cw attack")
+
+    # 3.2 FaceLock arguments (Mask & Plot)
+    parser.add_argument("--plot_history", action='store_true', help="plot loss history (facelock only)")
+    parser.add_argument("--dlib_path", default="shape_predictor_68_face_landmarks.dat", type=str, help="path to dlib predictor")
 
     # 4. Output arguments
-    parser.add_argument("--output_path", default="output.png", type=str, help="Path to save the protected image")
-    
+    parser.add_argument("--output_path", default=None, type=str, help="path to save protected image")
+
     return parser
 
-# ... (Encoder/VAE/CW attack 函數保持不變) ...
+# ==============================================================================
+# Wrappers
+# ==============================================================================
+
 def process_encoder_attack(X, model, args):
-    print(f"Running Encoder Attack (eps={args.attack_budget}, iters={args.num_iters})...")
     with torch.autocast("cuda"):
-        X_adv = encoder_attack(
-            X=X, model=model, eps=args.attack_budget, step_size=args.step_size,
-            iters=args.num_iters, clamp_min=-1, clamp_max=1, targeted=args.targeted,
+        X_adv, history = encoder_attack(
+            X=X,
+            model=model,
+            eps=args.attack_budget,
+            step_size=args.step_size,
+            iters=args.num_iters,
+            clamp_min=-1,
+            clamp_max=1,
+            targeted=args.targeted,
         )
-    return X_adv
+    return X_adv, history
 
 def process_vae_attack(X, model, args):
-    print(f"Running VAE Attack (eps={args.attack_budget}, iters={args.num_iters})...")
     with torch.autocast("cuda"):
-        X_adv = vae_attack(
-            X=X, model=model, eps=args.attack_budget, step_size=args.step_size,
-            iters=args.num_iters, clamp_min=-1, clamp_max=1,
+        X_adv, history = vae_attack(
+            X=X,
+            model=model,
+            eps=args.attack_budget,
+            step_size=args.step_size,
+            iters=args.num_iters,
+            clamp_min=-1,
+            clamp_max=1,
         )
-    return X_adv
+    return X_adv, history
 
 def process_cw_attack(X, model, args):
-    print(f"Running CW L2 Attack (c={args.c}, lr={args.lr}, iters={args.num_iters})...")
-    X_adv = cw_l2_attack(X=X, model=model, c=args.c, lr=args.lr, iters=args.num_iters)
+    X_adv, history = cw_l2_attack(
+        X=X,
+        model=model,
+        c=args.c,
+        lr=args.lr,
+        iters=args.num_iters,
+    )
     delta = X_adv - X
     delta_clip = delta.clip(-args.attack_budget, args.attack_budget)
     X_adv = (X + delta_clip).clip(0, 1)
-    return X_adv
+    return X_adv, history
 
-# =========================================================
-# [修改重點] 輕量化的 Facelock 處理流程
-# =========================================================
 def process_facelock(X, model, args):
-    print(f"Running Anti-Inpainting Facelock (eps={args.attack_budget}, iters={args.num_iters})...")
-    
-    # [移除] 不再載入 ArcFace 和 Aligner 模型，節省顯存
+    # Load auxiliary models
+    fr_id = 'minchul/cvlface_adaface_vit_base_kprpe_webface4m'
+    aligner_id = 'minchul/cvlface_DFA_mobilenet'
     device = 'cuda'
-    
-    # 只需要 LPIPS 來維持畫質
+
+    print("[Defend] Loading FaceLock auxiliary models...")
+    fr_model = load_model_by_repo_id(repo_id=fr_id,
+                                     save_path=f'{os.environ["HF_HOME"]}/{fr_id}',
+                                     HF_TOKEN=os.environ.get('HUGGINGFACE_HUB_TOKEN')).to(device)
+    aligner = load_model_by_repo_id(repo_id=aligner_id,
+                                    save_path=f'{os.environ["HF_HOME"]}/{aligner_id}',
+                                    HF_TOKEN=os.environ.get('HUGGINGFACE_HUB_TOKEN')).to(device)
     lpips_fn = lpips.LPIPS(net="vgg").to(device)
 
     with torch.autocast("cuda"):
-        X_adv = facelock(
+        # Instantiate the Attacker Class
+        attacker = FaceLockAttacker(predictor_path=args.dlib_path)
+
+        # ============================================================
+        # --- [新增] Mask 可視化區塊 ---
+        # ============================================================
+        print("[Defend] Generating visualization mask...")
+        # 這裡必須使用與 methods.py 中 attack 函數相同的參數 (pad=50, blur=20)
+        # 才能看到真正被使用的 Mask
+        mask_tensor = attacker.get_face_mask(X, pad=50, blur_sigma=20)
+        
+        # 將 Tensor (0.0~1.0) 轉換為 NumPy 圖片格式 (0~255)
+        mask_np = mask_tensor.squeeze().cpu().permute(1, 2, 0).numpy()
+        mask_img_np = (mask_np * 255).astype(np.uint8)
+
+        # Run Attack
+        # 確保是 RGB 格式以便存檔
+        if mask_img_np.shape[2] == 1:
+             mask_img_np = np.repeat(mask_img_np, 3, axis=2)
+
+        mask_pil = Image.fromarray(mask_img_np)
+
+        # 決定儲存路徑 (存到跟 output_path 同一個資料夾下)
+        base_dir = os.path.dirname(args.output_path) if args.output_path else "."
+        # 如果 output_path 是純檔名，base_dir 會是空字串，修正為當前目錄
+        if not base_dir: base_dir = "."
+            
+        mask_save_path = os.path.join(base_dir, "visualized_mask.png")
+        mask_pil.save(mask_save_path)
+        print(f"[Defend] Mask visualization saved to: {mask_save_path}")
+        # ============================================================
+
+
+        # Run Attack (正常執行攻擊)
+        X_adv, history = attacker.attack(
             X=X,
             model=model,
-            aligner=None,   # [修改] 傳入 None 即可
-            fr_model=None,  # [修改] 傳入 None 即可
+            aligner=aligner,
+            fr_model=fr_model,
             lpips_fn=lpips_fn,
             eps=args.attack_budget,
             step_size=args.step_size,
             iters=args.num_iters,
             clamp_min=-1,
             clamp_max=1,
-            plot=args.plot
+            plot_history=args.plot_history
         )
-    return X_adv
+
+    return X_adv, history
+
+# ==============================================================================
+# Main
+# ==============================================================================
 
 def main(args):
-    # 0. Check CUDA
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. This script requires a GPU.")
-
-    # 1. Prepare the image
-    print(f"Loading image from {args.input_path}...")
+    print(f"Loading image: {args.input_path}")
     init_image = Image.open(args.input_path).convert("RGB")
-    
     to_tensor = torchvision.transforms.ToTensor()
+
     if args.defend_method != "cw":
         X = pil_to_input(init_image).cuda().half()
     else:
         X = to_tensor(init_image).cuda().unsqueeze(0)
 
-    # 2. Prepare the targeted model
-    print(f"Loading target model: {args.target_model} ({args.model_id})...")
-    model = None
+    print(f"Loading Target Model: {args.target_model}...")
     dtype = torch.float16 if args.defend_method != "cw" else torch.float32
 
     if args.target_model == "stable-diffusion":
         model = StableDiffusionImg2ImgPipeline.from_pretrained(
-            pretrained_model_name_or_path=args.model_id,
-            torch_dtype=dtype,
-            safety_checker=None,
+            args.model_id, torch_dtype=dtype, safety_checker=None
         )
     elif args.target_model == "instruct-pix2pix":
         model = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            pretrained_model_name_or_path=args.model_id,
-            torch_dtype=dtype,
-            safety_checker=None,
+            args.model_id, torch_dtype=dtype, safety_checker=None
         )
         model.scheduler = EulerAncestralDiscreteScheduler.from_config(model.scheduler.config)
     else:
-        raise ValueError(f"Invalid target_model '{args.target_model}'.")
-    
+        raise ValueError(f"Unknown target_model: {args.target_model}")
+
     model.to("cuda")
 
-    # 3. Set up defense method
+    # Select Method
     defend_fn = None
     if args.defend_method == "encoder":
         defend_fn = process_encoder_attack
@@ -149,26 +196,36 @@ def main(args):
     elif args.defend_method == "facelock":
         defend_fn = process_facelock
     else:
-        raise ValueError(f"Invalid defend_method '{args.defend_method}'.")
-    
-    # 4. Process defense
-    X_adv = defend_fn(X, model, args)
+        raise ValueError(f"Unknown defend_method: {args.defend_method}")
 
-    # 5. Convert back to image and save
-    print(f"Saving protected image to {args.output_path}...")
+    print(f"Running Defend: {args.defend_method}...")
+    X_adv, history = defend_fn(X, model, args)
+
+    if history is not None:
+        print("Defend complete.")
+
+    # Save
     to_pil = torchvision.transforms.ToPILImage()
-    
     if args.defend_method != "cw":
         X_adv = (X_adv / 2 + 0.5).clamp(0, 1)
-    
-    if X_adv.dim() == 4:
-        X_adv = X_adv[0]
-        
-    protected_image = to_pil(X_adv.float()).convert("RGB")
-    protected_image.save(args.output_path)
-    print("Done!")
+    else:
+        X_adv = X_adv.clamp(0, 1)
+
+    protected_image = to_pil(X_adv[0]).convert("RGB")
+
+    if args.output_path:
+        protected_image.save(args.output_path)
+        print(f"Saved to: {args.output_path}")
+    else:
+        print("Warning: No output path provided.")
 
 if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
+
+    if args.output_path is None:
+        base, ext = os.path.splitext(args.input_path)
+        args.output_path = f"{base}_{args.defend_method}{ext}"
+        print(f"Output defaults to: {args.output_path}")
+
     main(args)
