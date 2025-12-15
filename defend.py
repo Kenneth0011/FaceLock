@@ -10,7 +10,7 @@ import pdb
 
 # --- Import 自定義模組 ---
 from utils import load_model_by_repo_id, pil_to_input
-from methods import cw_l2_attack, vae_attack, encoder_attack, facelock_robust
+from methods import cw_l2_attack, vae_attack, encoder_attack, facelock
 
 # --- Import Diffusers ---
 from diffusers import StableDiffusionInstructPix2PixPipeline, StableDiffusionImg2ImgPipeline, EulerAncestralDiscreteScheduler
