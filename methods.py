@@ -59,7 +59,6 @@ def plot_facelock_history(history, save_name="facelock_robust_convergence.png"):
 # -----------------------------
 def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
     encoder = model.vae.encode
-    # 確保 encoder 參數凍結
     for p in encoder.parameters(): p.requires_grad = False
     
     clean_latents = encoder(X).latent_dist.mean
@@ -100,7 +99,6 @@ def cw_l2_attack(X, model, c=0.1, lr=0.01, iters=100, targeted=False):
 # -----------------------------
 def encoder_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, targeted=False):
     encoder = model.vae.encode
-    # 確保參數凍結
     for p in encoder.parameters(): p.requires_grad = False
 
     X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).half().cuda(), min=clamp_min, max=clamp_max)
@@ -136,7 +134,6 @@ def encoder_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, 
 # -----------------------------
 def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1):
     vae = model.vae
-    # 確保參數凍結
     for p in vae.parameters(): p.requires_grad = False
 
     X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).half().cuda(), min=clamp_min, max=clamp_max)
@@ -160,31 +157,30 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
     return X_adv, history 
 
 # -----------------------------
-# 4. FaceLock Robust (記憶體優化版)
+# 4. FaceLock Robust (Fix Type Version)
 # -----------------------------
 def facelock_robust(X, model, aligner, fr_model, lpips_fn, 
                     eps=0.03, step_size=0.01, iters=100, 
                     clamp_min=-1, clamp_max=1, 
                     decay=1.0, noise_std=0.005, plot_history=False): 
     
-    # [關鍵優化 1] 強制凍結所有模型的梯度，避免 PyTorch 記錄反向傳播圖
-    # 這能釋放大量顯存，因為我們只需要對 X_adv 求導
+    # 鎖定模型參數
     print("🔒 Freezing model parameters to save memory...")
     model.vae.requires_grad_(False)
     aligner.requires_grad_(False)
     fr_model.requires_grad_(False)
     lpips_fn.requires_grad_(False)
     
-    # 確保它們處於 eval 模式 (關閉 Dropout / BatchNorm 更新)
     model.vae.eval()
     aligner.eval()
     fr_model.eval()
     lpips_fn.eval()
 
-    # 初始化對抗樣本
+    # 初始化
     X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device), min=clamp_min, max=clamp_max)
     
     is_half = (X.dtype == torch.float16)
+    # 若原圖是 float16，先轉 float32 確保精度，最後再轉回
     if is_half:
         X_adv = X_adv.float()
         X = X.float()
@@ -192,8 +188,13 @@ def facelock_robust(X, model, aligner, fr_model, lpips_fn,
     X_adv.requires_grad_(True)
     
     vae = model.vae
+    # VAE 需要跟著 dtype 走，如果是 float32 input，確保 vae 也能處理
+    # 但 diffusers VAE 通常固定在 float16 或 float32。
+    # 為了安全，我們讓 VAE encode/decode 時自動 autocast
+    
     with torch.no_grad():
-        clean_latent = vae.encode(X).latent_dist.mean.detach()
+        with torch.autocast("cuda"): # 自動處理精度
+            clean_latent = vae.encode(X).latent_dist.mean.detach()
 
     momentum = torch.zeros_like(X_adv).detach().to(X.device)
 
@@ -205,18 +206,22 @@ def facelock_robust(X, model, aligner, fr_model, lpips_fn,
     for i in pbar:
         actual_step_size = step_size - (step_size - step_size / 100) / iters * i
         
-        # [關鍵優化 2] 使用 checkpointing (如果顯存還是不夠，這會用計算換空間)
-        # 但 diffusers VAE 預設不支援直接的 checkpointing call，我們先依賴凍結參數
-        
-        latent = vae.encode(X_adv).latent_dist.mean
-        image_rec = vae.decode(latent).sample.clip(-1, 1)
+        # 使用 autocast 讓 VAE 可以在 float16 下運作，節省記憶體
+        with torch.autocast("cuda"):
+            latent = vae.encode(X_adv).latent_dist.mean
+            image_rec = vae.decode(latent).sample.clip(-1, 1)
 
-        aug_noise = torch.randn_like(image_rec) * noise_std
-        image_noisy = image_rec + aug_noise
+            aug_noise = torch.randn_like(image_rec) * noise_std
+            image_noisy = image_rec + aug_noise
         
-        loss_cvl = compute_score(image_noisy, X, aligner=aligner, fr_model=fr_model)
+        # [Fix Type] 這裡最重要：Aligner 只吃 float32
+        # 我們把 image_noisy 和 X 強制轉成 .float() 再傳入
+        loss_cvl = compute_score(image_noisy.float(), X.float(), aligner=aligner, fr_model=fr_model)
+        
         loss_encoder = F.mse_loss(latent, clean_latent)
-        loss_lpips = lpips_fn(image_rec, X) 
+        
+        # LPIPS 內部通常也是 float32 運算比較穩
+        loss_lpips = lpips_fn(image_rec.float(), X.float())
         
         w_cvl = 2.0 if i >= iters * 0.15 else 0.0
         w_lpips = 1.0 if i > iters * 0.25 else 0.0
