@@ -180,7 +180,7 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 # 請將這段程式碼覆蓋 methods.py 中的 facelock 函式
 
-def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.05, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, plot_history=False, tv_weight=0): 
+def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.07, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, plot_history=False, tv_weight=0): 
     # [設定] 極致攻擊模式
     # 這裡直接對圖片進行梯度上升 (Gradient Ascent)，最大化 Loss
     
@@ -215,7 +215,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.05, step_size=0.01, it
 
         # 權重分配：全力攻擊人臉 (CVL)，輔助攻擊特徵 (Encoder)
         # 這裡使用梯度上升邏輯
-        loss = -loss_cvl * 5.0 + loss_encoder *0.5
+        loss = -loss_cvl * 5.0 + loss_encoder *1.0
 
         grad, = torch.autograd.grad(loss, [X_adv])
         
