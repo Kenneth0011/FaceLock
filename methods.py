@@ -206,7 +206,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.05, step_size=0.01, it
 
         # 權重分配：全力攻擊人臉 (CVL)，輔助攻擊特徵 (Encoder)
         # 這裡使用梯度上升邏輯
-        loss = -loss_cvl * 20.0 + loss_encoder * 5.0
+        loss = -loss_cvl * 2.0 + loss_encoder *0.2
 
         grad, = torch.autograd.grad(loss, [X_adv])
         
