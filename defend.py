@@ -101,7 +101,7 @@ def process_facelock(X, model, args):
     lpips_fn = lpips.LPIPS(net="vgg").to(device)
 
     with torch.autocast("cuda"):
-        result = facelock_robust(
+        result = facelock(
             X=X,
             model=model,
             aligner=aligner,
