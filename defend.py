@@ -5,12 +5,11 @@ import numpy as np
 import torch
 import torchvision
 import lpips
+import gc # [新增] 垃圾回收
 import pdb
 
 # --- Import 自定義模組 ---
-# 請確認 utils.py 和 methods.py 在同一目錄下
 from utils import load_model_by_repo_id, pil_to_input
-# 注意：這裡 import 的是 facelock_robust
 from methods import cw_l2_attack, vae_attack, encoder_attack, facelock_robust
 
 # --- Import Diffusers ---
@@ -40,7 +39,6 @@ def get_args_parser():
 
     # 4. Output & Logging arguments
     parser.add_argument("--output_path", default=None, type=str, help="path to save the protected image")
-    # [新增] 讓指令可以控制是否畫圖
     parser.add_argument("--plot_history", action='store_true', help="save the loss convergence plot")
 
     return parser
@@ -57,7 +55,6 @@ def process_encoder_attack(X, model, args):
             clamp_max=1,
             targeted=args.targeted,
         )
-        # 兼容性處理：若回傳 tuple 則取第一個元素
         X_adv = result[0] if isinstance(result, tuple) else result
     return X_adv
 
@@ -83,10 +80,7 @@ def process_cw_attack(X, model, args):
         lr=args.lr,
         iters=args.num_iters,
     )
-    
     X_adv = result[0] if isinstance(result, tuple) else result
-
-    # CW 後處理：Clip 到 budget 範圍內
     delta = X_adv - X
     delta_clip = delta.clip(-args.attack_budget, args.attack_budget)
     X_adv = (X + delta_clip).clip(0, 1)
@@ -97,7 +91,6 @@ def process_facelock(X, model, args):
     aligner_id = 'minchul/cvlface_DFA_mobilenet'
     device = 'cuda'
     
-    # 載入輔助模型
     print(f"Loading FR model: {fr_id}...")
     fr_model = load_model_by_repo_id(repo_id=fr_id,
                                      save_path=f'{os.environ["HF_HOME"]}/{fr_id}',
@@ -108,7 +101,6 @@ def process_facelock(X, model, args):
     lpips_fn = lpips.LPIPS(net="vgg").to(device)
 
     with torch.autocast("cuda"):
-        # 呼叫 Robust 版函數
         result = facelock_robust(
             X=X,
             model=model,
@@ -120,23 +112,24 @@ def process_facelock(X, model, args):
             iters=args.num_iters,
             clamp_min=-1,
             clamp_max=1,
-            decay=1.0,         # 預設開啟動量
-            noise_std=0.01,    # 預設開啟抗噪
-            plot_history=args.plot_history  # [關鍵修改] 傳入參數
+            decay=1.0,         
+            noise_std=0.01,    
+            plot_history=args.plot_history
         )
-        
-        # 解包 (Image, History)
         X_adv = result[0] 
 
+    # [Memory Fix] 清理這些輔助模型以釋放記憶體
+    del fr_model, aligner, lpips_fn
+    torch.cuda.empty_cache()
+    
     return X_adv
 
 def main(args):
-    # 0. 檢查輸出路徑資料夾是否存在，不存在則建立
+    # 0. 檢查輸出路徑
     if args.output_path:
         out_dir = os.path.dirname(args.output_path)
         if out_dir and not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
-            print(f"Created output directory: {out_dir}")
 
     # 1. Prepare image
     print(f"Loading image from {args.input_path}...")
@@ -146,21 +139,23 @@ def main(args):
         X = pil_to_input(init_image).cuda().half()
     else:
         to_tensor = torchvision.transforms.ToTensor()
-        X = to_tensor(init_image).cuda().unsqueeze(0) # float32 for CW
+        X = to_tensor(init_image).cuda().unsqueeze(0)
 
     # 2. Prepare Target Model
     print(f"Loading target model: {args.target_model} ({args.model_id})...")
     model = None
+    dtype = torch.float16 if args.defend_method != "cw" else torch.float32
+
     if args.target_model == "stable-diffusion":
         model = StableDiffusionImg2ImgPipeline.from_pretrained(
             pretrained_model_name_or_path=args.model_id,
-            torch_dtype=torch.float16 if args.defend_method != "cw" else torch.float32,
+            torch_dtype=dtype,
             safety_checker=None,
         )
     elif args.target_model == "instruct-pix2pix":
         model = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             pretrained_model_name_or_path=args.model_id,
-            torch_dtype=torch.float16 if args.defend_method != "cw" else torch.float32,
+            torch_dtype=dtype,
             safety_checker=None,
         )
         model.scheduler = EulerAncestralDiscreteScheduler.from_config(model.scheduler.config)
@@ -168,6 +163,34 @@ def main(args):
         raise ValueError(f"Invalid target_model '{args.target_model}'.")
     
     model.to("cuda")
+
+    # ---------------------------------------------------------
+    # [Memory Fix] 記憶體優化關鍵步驟
+    # ---------------------------------------------------------
+    if args.defend_method in ["facelock", "vae", "encoder"]:
+        print("⚡ Optimizing memory: Offloading UNet/TextEncoder to CPU...")
+        
+        # 1. 將不需參與攻擊計算的模組移至 CPU
+        if hasattr(model, "unet"):
+            model.unet = model.unet.to("cpu")
+        if hasattr(model, "text_encoder"):
+            model.text_encoder = model.text_encoder.to("cpu")
+        if hasattr(model, "safety_checker") and model.safety_checker is not None:
+            model.safety_checker = model.safety_checker.to("cpu")
+            
+        # 2. 強制進行垃圾回收與顯存清理
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 3. 啟用 VAE Slicing/Tiling (這能大幅降低 decode 時的顯存峰值)
+        if hasattr(model, "vae"):
+            print("⚡ Enabling VAE Slicing & Tiling for memory efficiency...")
+            model.vae.enable_slicing()
+            try:
+                model.vae.enable_tiling()
+            except AttributeError:
+                pass # 舊版 diffusers 可能沒有 enable_tiling
+    # ---------------------------------------------------------
 
     # 3. Select Defense Method
     defend_fn = None
@@ -189,11 +212,9 @@ def main(args):
     # 5. Save Output
     to_pil = torchvision.transforms.ToPILImage()
     
-    # Post-processing: Denormalize [-1, 1] -> [0, 1]
     if args.defend_method != "cw":
         X_adv = (X_adv / 2 + 0.5).clamp(0, 1)
     
-    # Remove batch dimension if present
     if len(X_adv.shape) == 4:
         X_adv = X_adv[0]
 
@@ -202,8 +223,6 @@ def main(args):
     if args.output_path:
         protected_image.save(args.output_path)
         print(f"✅ Protected image saved to: {args.output_path}")
-    else:
-        print("⚠️ Warning: No output path specified. Image not saved.")
 
 if __name__ == "__main__":
     parser = get_args_parser()
