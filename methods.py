@@ -19,8 +19,9 @@ import matplotlib.pyplot as plt
 def plot_facelock_history(history, save_name="facelock_robust_convergence.png"):
     print("Plotting losses...")
     plt.figure(figsize=(12, 10))
-    plt.suptitle('FaceLock Robust Optimization History', fontsize=16)
+    plt.suptitle('Biometric Erasure Optimization History', fontsize=16)
 
+    # 圖 1: Total Loss
     plt.subplot(2, 2, 1)
     plt.plot(history['total_loss'])
     plt.title('Total Loss')
@@ -28,13 +29,16 @@ def plot_facelock_history(history, save_name="facelock_robust_convergence.png"):
     plt.ylabel('Loss')
     plt.grid(True)
 
+    # 圖 2: CVL Loss (人臉辨識分數)
     plt.subplot(2, 2, 2)
     plt.plot(history['loss_cvl'], color='red')
-    plt.title('Face Recognition Score (High = Preserved)')
+    # [修改標題] 這次我們希望分數越低越好
+    plt.title('Face Recognition Score (Lower = Erasure Success)')
     plt.xlabel('Iteration')
     plt.ylabel('Score')
     plt.grid(True)
 
+    # 圖 3: Encoder Loss
     plt.subplot(2, 2, 3)
     plt.plot(history['loss_encoder'], color='green')
     plt.title('Encoder MSE Loss (Latent Consistency)')
@@ -42,6 +46,7 @@ def plot_facelock_history(history, save_name="facelock_robust_convergence.png"):
     plt.ylabel('Loss')
     plt.grid(True)
 
+    # 圖 4: LPIPS Loss
     plt.subplot(2, 2, 4)
     plt.plot(history['loss_lpips'], color='purple')
     plt.title('Perceptual Similarity (LPIPS)')
@@ -157,14 +162,13 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
     return X_adv, history 
 
 # -----------------------------
-# 4. FaceLock Robust (Fix Type Version)
+# 4. Face Erasure Robust (Updated for Biometric Erasure)
 # -----------------------------
 def facelock_robust(X, model, aligner, fr_model, lpips_fn, 
                     eps=0.03, step_size=0.01, iters=100, 
                     clamp_min=-1, clamp_max=1, 
                     decay=1.0, noise_std=0.005, plot_history=False): 
     
-    # 鎖定模型參數
     print("🔒 Freezing model parameters to save memory...")
     model.vae.requires_grad_(False)
     aligner.requires_grad_(False)
@@ -176,11 +180,9 @@ def facelock_robust(X, model, aligner, fr_model, lpips_fn,
     fr_model.eval()
     lpips_fn.eval()
 
-    # 初始化
     X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device), min=clamp_min, max=clamp_max)
     
     is_half = (X.dtype == torch.float16)
-    # 若原圖是 float16，先轉 float32 確保精度，最後再轉回
     if is_half:
         X_adv = X_adv.float()
         X = X.float()
@@ -188,45 +190,36 @@ def facelock_robust(X, model, aligner, fr_model, lpips_fn,
     X_adv.requires_grad_(True)
     
     vae = model.vae
-    # VAE 需要跟著 dtype 走，如果是 float32 input，確保 vae 也能處理
-    # 但 diffusers VAE 通常固定在 float16 或 float32。
-    # 為了安全，我們讓 VAE encode/decode 時自動 autocast
-    
     with torch.no_grad():
-        with torch.autocast("cuda"): # 自動處理精度
+        with torch.autocast("cuda"):
             clean_latent = vae.encode(X).latent_dist.mean.detach()
 
     momentum = torch.zeros_like(X_adv).detach().to(X.device)
 
     history = {'total_loss': [], 'loss_cvl': [], 'loss_encoder': [], 'loss_lpips': []}
 
-    print(f"Starting FaceLock Robust Attack (Iters={iters}, Momentum={decay}, Noise={noise_std})...")
+    print(f"Starting Face Erasure Attack (Iters={iters}, Momentum={decay}, Noise={noise_std})...")
     pbar = tqdm(range(iters))
     
     for i in pbar:
         actual_step_size = step_size - (step_size - step_size / 100) / iters * i
         
-        # 使用 autocast 讓 VAE 可以在 float16 下運作，節省記憶體
         with torch.autocast("cuda"):
             latent = vae.encode(X_adv).latent_dist.mean
             image_rec = vae.decode(latent).sample.clip(-1, 1)
-
+            
             aug_noise = torch.randn_like(image_rec) * noise_std
             image_noisy = image_rec + aug_noise
         
-        # [Fix Type] 這裡最重要：Aligner 只吃 float32
-        # 我們把 image_noisy 和 X 強制轉成 .float() 再傳入
         loss_cvl = compute_score(image_noisy.float(), X.float(), aligner=aligner, fr_model=fr_model)
-        
         loss_encoder = F.mse_loss(latent, clean_latent)
-        
-        # LPIPS 內部通常也是 float32 運算比較穩
         loss_lpips = lpips_fn(image_rec.float(), X.float())
         
         w_cvl = 2.0 if i >= iters * 0.15 else 0.0
         w_lpips = 1.0 if i > iters * 0.25 else 0.0
         
-        loss = -loss_cvl * w_cvl + loss_encoder * 0.2 + loss_lpips * w_lpips
+        # [關鍵修改] 這裡改成「正號」，代表我們要 Minimize Similarity (讓它不像)
+        loss = loss_cvl * w_cvl + loss_encoder * 0.2 + loss_lpips * w_lpips
         
         if X_adv.grad is not None:
             X_adv.grad.zero_()
@@ -237,6 +230,7 @@ def facelock_robust(X, model, aligner, fr_model, lpips_fn,
         grad = grad / (grad_norm + 1e-10)
         momentum = decay * momentum + grad
         
+        # 因為我們要 Minimize Loss，所以是減去梯度 (Gradient Descent)
         X_adv = X_adv - momentum.sign() * actual_step_size
 
         X_adv = torch.minimum(torch.maximum(X_adv, X - eps), X + eps)
