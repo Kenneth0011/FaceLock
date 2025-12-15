@@ -15,55 +15,64 @@ import matplotlib.pyplot as plt
 # -----------------------------
 
 # --- 繪圖輔助函數 (維持存檔) ---
-def plot_facelock_history(history):
-    """
-    專門用來繪製 facelock 函數回傳的 history 字典
-    """
-    print("Plotting losses...")
+# 請覆蓋 methods.py 中的 plot_facelock_history 函式
 
-    # 建立一個 2x2 的圖表方格
-    plt.figure(figsize=(12, 10))
-    plt.suptitle('FaceLock Loss Convergence', fontsize=16)
+def plot_facelock_history(history):
+    print("Plotting losses...")
+    
+    # 檢查是否有 LPIPS 數據，決定要畫幾張圖
+    has_lpips = 'loss_lpips' in history and len(history['loss_lpips']) > 0
+    
+    if has_lpips:
+        # 如果有 4 個數據，維持原本的 2x2 版面
+        plt.figure(figsize=(12, 10))
+        layout = (2, 2)
+    else:
+        # 如果只有 3 個數據 (極致模式)，改用 1x3 版面
+        plt.figure(figsize=(18, 5))
+        layout = (1, 3)
+
+    plt.suptitle('FaceLock Loss Convergence (Aggressive Mode)', fontsize=16)
 
     # 圖 1: Total Loss
-    plt.subplot(2, 2, 1)
+    plt.subplot(layout[0], layout[1], 1)
     plt.plot(history['total_loss'])
     plt.title('Total Loss')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
     plt.grid(True)
 
-    # 圖 2: CVL Loss (人臉辨識分數)
-    plt.subplot(2, 2, 2)
+    # 圖 2: CVL Loss (人臉辨識分數 - 越低越好)
+    plt.subplot(layout[0], layout[1], 2)
     plt.plot(history['loss_cvl'], color='red')
     plt.title('Face Recognition Score (loss_cvl)')
     plt.xlabel('Iteration')
-    plt.ylabel('Score')
+    plt.ylabel('Score (Lower is Better)')
     plt.grid(True)
 
-    # 圖 3: Encoder Loss (潛在空間距離)
-    plt.subplot(2, 2, 3)
+    # 圖 3: Encoder Loss (特徵破壞程度 - 越高越好)
+    plt.subplot(layout[0], layout[1], 3)
     plt.plot(history['loss_encoder'], color='green')
-    plt.title('Encoder MSE Loss (loss_encoder)')
+    plt.title('Encoder MSE Loss (Disruption)')
     plt.xlabel('Iteration')
-    plt.ylabel('Loss')
+    plt.ylabel('Loss (Higher is Better)')
     plt.grid(True)
 
-    # 圖 4: LPIPS Loss (影像感知相似度)
-    plt.subplot(2, 2, 4)
-    plt.plot(history['loss_lpips'], color='purple')
-    plt.title('Perceptual Similarity (loss_lpips)')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
+    # 圖 4: LPIPS (如果有才畫)
+    if has_lpips:
+        plt.subplot(2, 2, 4)
+        plt.plot(history['loss_lpips'], color='purple')
+        plt.title('Perceptual Similarity (loss_lpips)')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
 
-    # 調整排版並儲存圖表
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     
     save_path = "facelock_loss_convergence.png"
     plt.savefig(save_path) 
     print(f"Loss plot saved to: {save_path}")
-    # plt.show() # 在 Agg 模式下無法運作
+    plt.close() # 關閉圖表釋放記憶體
 # -----------------------------
 
 
