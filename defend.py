@@ -5,7 +5,7 @@ import torch
 import torchvision
 import lpips
 from utils import load_model_by_repo_id, pil_to_input
-# 注意：這裡會 import 上一個檔案 (methods.py)
+# 這裡會 import 剛剛修改過的 methods.py
 from methods import cw_l2_attack, vae_attack, encoder_attack, facelock 
 import argparse
 from diffusers import StableDiffusionInstructPix2PixPipeline, StableDiffusionImg2ImgPipeline, EulerAncestralDiscreteScheduler
@@ -36,15 +36,13 @@ def get_args_parser():
     # 4. output arguments
     parser.add_argument("--output_path", default=None, type=str, help="the output path the protected images")
 
-    # --- ↓↓↓ 新增這個參數 ↓↓↓ ---
+    # 畫圖參數
     parser.add_argument("--plot_history", action='store_true', help="Plot the loss history after the attack (only for facelock)")
-    # -----------------------------
     
     return parser
 
 def process_encoder_attack(X, model, args):
     with torch.autocast("cuda"):
-        # --- ↓↓↓ 修改：接收 history ↓↓↓ ---
         X_adv, history = encoder_attack(
             X=X,
             model=model,
@@ -55,11 +53,10 @@ def process_encoder_attack(X, model, args):
             clamp_max=1,
             targeted=args.targeted,
         )
-    return X_adv, history # <-- 修改回傳值
+    return X_adv, history
 
 def process_vae_attack(X, model, args):
     with torch.autocast("cuda"):
-        # --- ↓↓↓ 修改：接收 history ↓↓↓ ---
         X_adv, history = vae_attack(
             X=X,
             model=model,
@@ -69,10 +66,9 @@ def process_vae_attack(X, model, args):
             clamp_min=-1,
             clamp_max=1,
         )
-    return X_adv, history # <-- 修改回傳值
+    return X_adv, history
 
 def process_cw_attack(X, model, args):
-    # --- ↓↓↓ 修改：接收 history ↓↓↓ ---
     X_adv, history = cw_l2_attack(
         X=X,
         model=model,
@@ -83,12 +79,17 @@ def process_cw_attack(X, model, args):
     delta = X_adv - X
     delta_clip = delta.clip(-args.attack_budget, args.attack_budget)
     X_adv = (X + delta_clip).clip(0, 1)
-    return X_adv, history # <-- 修改回傳值
+    return X_adv, history
 
+# ==========================================
+# [關鍵修改] process_facelock
+# ==========================================
 def process_facelock(X, model, args):
     fr_id = 'minchul/cvlface_adaface_vit_base_kprpe_webface4m'
     aligner_id = 'minchul/cvlface_DFA_mobilenet'
     device = 'cuda'
+    
+    # 載入 FR 模型與 Aligner
     fr_model = load_model_by_repo_id(repo_id=fr_id,
                                      save_path=f'{os.environ["HF_HOME"]}/{fr_id}',
                                      HF_TOKEN=os.environ['HUGGINGFACE_HUB_TOKEN']).to(device)
@@ -97,49 +98,60 @@ def process_facelock(X, model, args):
                                     HF_TOKEN=os.environ['HUGGINGFACE_HUB_TOKEN']).to(device)
     lpips_fn = lpips.LPIPS(net="vgg").to(device)
 
+    print(">>> 呼叫 FaceLock 結構破壞版...")
+
     with torch.autocast("cuda"):
-        # --- ↓↓↓ 修改：接收 history 並傳入 plot_history 參數 ↓↓↓ ---
         X_adv, history = facelock(
             X=X,
-            model=model,
+            model=model,        # 用於 VAE encode/decode
             aligner=aligner,
             fr_model=fr_model,
             lpips_fn=lpips_fn,
+            
+            # --- [新增] 傳入 Stable Diffusion Pipeline ---
+            sd_pipe=model,      # 這裡把 model (SD pipe) 傳進去，啟動 Structure Attack
+            # ---------------------------------------------
+            
             eps=args.attack_budget,
             step_size=args.step_size,
             iters=args.num_iters,
             clamp_min=-1,
             clamp_max=1,
-            plot_history=args.plot_history # <-- 傳入新參數
+            plot_history=args.plot_history
         )
-    return X_adv, history # <-- 修改回傳值
+    return X_adv, history
 
 def main(args):
     # 1. prepare the image
     init_image = Image.open(args.input_path).convert("RGB")
     to_tensor = torchvision.transforms.ToTensor()
     if args.defend_method != "cw":
+        # 如果記憶體不足，這邊可以確保輸入是 float16
         X = pil_to_input(init_image).cuda().half()
     else:
-        X = to_tensor(init_image).cuda().unsqueeze(0)    # perform cw attack using torch.float32
+        X = to_tensor(init_image).cuda().unsqueeze(0)    # cw attack needs float32
 
     # 2. prepare the targeted model
     model = None
+    dtype = torch.float16 if args.defend_method != "cw" else torch.float32
+    
+    print(f"Loading target model: {args.target_model} ({dtype})...")
+    
     if args.target_model == "stable-diffusion":
         model = StableDiffusionImg2ImgPipeline.from_pretrained(
             pretrained_model_name_or_path=args.model_id,
-            torch_dtype=torch.float16 if args.defend_method != "cw" else torch.float32,
+            torch_dtype=dtype,
             safety_checker=None,
         )
     elif args.target_model == "instruct-pix2pix":
         model = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             pretrained_model_name_or_path=args.model_id,
-            torch_dtype=torch.float16 if args.defend_method != "cw" else torch.float32,
+            torch_dtype=dtype,
             safety_checker=None,
         )
         model.scheduler = EulerAncestralDiscreteScheduler.from_config(model.scheduler.config)
     else:
-        raise ValueError(f"Invalid target_model '{args.target_model}'. Valid options are 'stable-diffusion' or 'instruct-pix2pix'.")
+        raise ValueError(f"Invalid target_model '{args.target_model}'")
     
     model.to("cuda")
 
@@ -154,42 +166,31 @@ def main(args):
     elif args.defend_method == "facelock":
         defend_fn = process_facelock
     else:
-        raise ValueError(f"Invalid defend_method '{args.defend_method}'. Valid options are 'encoder', 'vae', 'cw', or 'facelock'.")
+        raise ValueError(f"Invalid defend_method '{args.defend_method}'")
     
     # 4. process defend
-    # --- ↓↓↓ 修改：接收 history ↓↓↓ ---
+    print(f"Starting attack using {args.defend_method}...")
     X_adv, history = defend_fn(X, model, args)
-    # ---------------------------------
     
     if history is not None:
-        print("Attack finished. Loss history generated (and plotted if requested).")
-        # 你也可以在這裡儲存 history，例如存成 JSON
-        # import json
-        # with open(args.output_path.replace('.png', '_history.json'), 'w') as f:
-        #     json.dump(history, f)
+        print("Attack finished.")
 
     # 5. convert back to image and store it
     to_pil = torchvision.transforms.ToPILImage()
     if args.defend_method != "cw":
         X_adv = (X_adv / 2 + 0.5).clamp(0, 1)
-    protected_image = to_pil(X_adv[0]).convert("RGB")
     
-    if args.output_path:
-        protected_image.save(args.output_path)
-        print(f"Protected image saved to {args.output_path}")
-    else:
-        print("Attack finished, but no output_path was specified. Image not saved.")
+    # 處理 output path
+    if args.output_path is None:
+        base, ext = os.path.splitext(args.input_path)
+        args.output_path = f"{base}_{args.defend_method}{ext}"
+    
+    protected_image = to_pil(X_adv[0]).convert("RGB")
+    protected_image.save(args.output_path)
+    print(f"Protected image saved to {args.output_path}")
 
 
 if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
-    
-    # 檢查 output_path 是否為空，如果為空給一個預設值
-    if args.output_path is None:
-        # 基於 input_path 產生一個預設的 output_path
-        base, ext = os.path.splitext(args.input_path)
-        args.output_path = f"{base}_{args.defend_method}{ext}"
-        print(f"No --output_path specified. Defaulting to: {args.output_path}")
-
     main(args)
