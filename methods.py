@@ -120,7 +120,7 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 
 # ==========================================
-# 2. Structure Disruption 相關模組 (手動 Reshape 版)
+# 2. Structure Disruption 相關模組 (增強穩健版)
 # ==========================================
 class AttentionStore:
     def __init__(self):
@@ -140,7 +140,10 @@ class AttackAttentionProcessor:
         self.place = place_in_unet
 
     def _batch_to_head_dim(self, tensor, heads):
-        # 手動將 (batch, seq_len, dim) -> (batch * heads, seq_len, head_dim)
+        # [關鍵修正]：如果 tensor 是 2D [Batch, Dim]，我們將其視為 [Batch, 1, Dim]
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(1)
+
         batch_size, seq_len, dim = tensor.shape
         head_dim = dim // heads
         tensor = tensor.reshape(batch_size, seq_len, heads, head_dim)
@@ -148,7 +151,6 @@ class AttackAttentionProcessor:
         return tensor.reshape(batch_size * heads, seq_len, head_dim)
 
     def _head_to_batch_dim(self, tensor, heads):
-        # 手動將 (batch * heads, seq_len, head_dim) -> (batch, seq_len, dim)
         batch_value, seq_len, head_dim = tensor.shape
         batch_size = batch_value // heads
         tensor = tensor.reshape(batch_size, heads, seq_len, head_dim)
@@ -167,7 +169,7 @@ class AttackAttentionProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
         
-        # [關鍵修改] 使用手動 Reshape 替代 attn.head_to_batch_dim
+        # 使用手動 Reshape 替代 attn.head_to_batch_dim
         query = self._batch_to_head_dim(query, attn.heads)
         key = self._batch_to_head_dim(key, attn.heads)
         value = self._batch_to_head_dim(value, attn.heads)
@@ -179,7 +181,7 @@ class AttackAttentionProcessor:
         
         hidden_states = torch.bmm(attention_probs, value)
         
-        # [關鍵修改] 手動轉回 batch dim
+        # 手動轉回 batch dim
         hidden_states = self._head_to_batch_dim(hidden_states, attn.heads)
         
         hidden_states = attn.to_out[0](hidden_states)
@@ -298,7 +300,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
-            # 使用 prepare_unet_input 自動處理通道數
             unet_input = prepare_unet_input(sd_pipe.unet, latents_clean)
             
             _ = sd_pipe.unet(unet_input, target_timestep, encoder_hidden_states=empty_embeds)
@@ -326,7 +327,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
-            # 使用 prepare_unet_input 自動處理通道數
             unet_input_adv = prepare_unet_input(sd_pipe.unet, latents_adv)
             
             _ = sd_pipe.unet(unet_input_adv, target_timestep, encoder_hidden_states=empty_embeds)
