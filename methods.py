@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -120,7 +121,7 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 
 # ==========================================
-# 2. Structure Disruption 相關模組 (增強穩健版)
+# 2. Structure Disruption 相關模組 (Dim修正版)
 # ==========================================
 class AttentionStore:
     def __init__(self):
@@ -140,9 +141,10 @@ class AttackAttentionProcessor:
         self.place = place_in_unet
 
     def _batch_to_head_dim(self, tensor, heads):
-        # [關鍵修正]：如果 tensor 是 2D [Batch, Dim]，我們將其視為 [Batch, 1, Dim]
+        # [關鍵修正]：如果 tensor 是 2D [Seq, Dim]，我們將其視為 [1, Seq, Dim]
+        # 之前錯誤使用 unsqueeze(1) 導致把 Seq 當成 Batch
         if tensor.dim() == 2:
-            tensor = tensor.unsqueeze(1)
+            tensor = tensor.unsqueeze(0) # <--- 正確修正：在最前面加 Batch 維度
 
         batch_size, seq_len, dim = tensor.shape
         head_dim = dim // heads
@@ -300,6 +302,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
+            # 使用 prepare_unet_input 自動處理通道數
             unet_input = prepare_unet_input(sd_pipe.unet, latents_clean)
             
             _ = sd_pipe.unet(unet_input, target_timestep, encoder_hidden_states=empty_embeds)
@@ -327,6 +330,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
+            # 使用 prepare_unet_input 自動處理通道數
             unet_input_adv = prepare_unet_input(sd_pipe.unet, latents_adv)
             
             _ = sd_pipe.unet(unet_input_adv, target_timestep, encoder_hidden_states=empty_embeds)
