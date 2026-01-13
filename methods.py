@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -10,7 +11,7 @@ import os
 import copy
 from utils import compute_score
 
-# 設定 Matplotlib 後端，避免在無介面環境報錯
+# 設定 Matplotlib 後端
 os.environ['MPLBACKEND'] = 'Agg'
 
 # ==========================================
@@ -238,6 +239,20 @@ def plot_facelock_history(history):
     plt.close()
 
 # ==========================================
+# [新增] 輔助函式：處理 U-Net 輸入通道不匹配問題
+# ==========================================
+def prepare_unet_input(unet, latents):
+    """
+    偵測 U-Net 需要的輸入通道數 (4 or 8) 並自動調整 latents。
+    InstructPix2Pix 需要 8 channels (latents + condition)，所以我們 duplicate latents。
+    """
+    in_channels = unet.config.in_channels
+    if in_channels == 8 and latents.shape[1] == 4:
+        # 重複 latents 以填補 condition channel
+        return torch.cat([latents, latents], dim=1)
+    return latents
+
+# ==========================================
 # 3. Facelock 主函式 (Structure Disruption 版)
 # ==========================================
 def facelock(X, model, aligner, fr_model, lpips_fn=None, 
@@ -269,7 +284,11 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             latents_clean = sd_pipe.vae.encode(X).latent_dist.sample() * 0.18215
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
-            _ = sd_pipe.unet(latents_clean, target_timestep, encoder_hidden_states=empty_embeds)
+            
+            # [修正] 使用 prepare_unet_input 自動處理通道數
+            unet_input = prepare_unet_input(sd_pipe.unet, latents_clean)
+            
+            _ = sd_pipe.unet(unet_input, target_timestep, encoder_hidden_states=empty_embeds)
             clean_attentions = copy.deepcopy(attention_store.current_attention)
             print(f"    已捕捉 {len(clean_attentions)} 層 Attention Map 作為結構基準")
 
@@ -293,7 +312,11 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             latents_adv = sd_pipe.vae.encode(X_adv).latent_dist.sample() * 0.18215
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
-            _ = sd_pipe.unet(latents_adv, target_timestep, encoder_hidden_states=empty_embeds)
+            
+            # [修正] 使用 prepare_unet_input 自動處理通道數
+            unet_input_adv = prepare_unet_input(sd_pipe.unet, latents_adv)
+            
+            _ = sd_pipe.unet(unet_input_adv, target_timestep, encoder_hidden_states=empty_embeds)
             
             adv_attentions = attention_store.current_attention
             
@@ -304,8 +327,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             if layer_losses:
                 loss_structure = torch.stack(layer_losses).mean()
 
-        # 根據報告需求：捨棄 LPIPS，專注於 FR 下降與 Structure 破壞
-        # 結構損失(loss_structure)越大代表結構破壞越嚴重，total_loss 需最大化
+        # 總 Loss 計算
         total_loss = -loss_cvl * 5.0 + loss_encoder * 1.0 
         
         if use_structure_attack:
