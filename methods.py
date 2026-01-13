@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -121,7 +120,7 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
 
 # ==========================================
-# 2. Structure Disruption 相關模組
+# 2. Structure Disruption 相關模組 (手動 Reshape 版)
 # ==========================================
 class AttentionStore:
     def __init__(self):
@@ -140,9 +139,26 @@ class AttackAttentionProcessor:
         self.store = store
         self.place = place_in_unet
 
+    def _batch_to_head_dim(self, tensor, heads):
+        # 手動將 (batch, seq_len, dim) -> (batch * heads, seq_len, head_dim)
+        batch_size, seq_len, dim = tensor.shape
+        head_dim = dim // heads
+        tensor = tensor.reshape(batch_size, seq_len, heads, head_dim)
+        tensor = tensor.permute(0, 2, 1, 3)
+        return tensor.reshape(batch_size * heads, seq_len, head_dim)
+
+    def _head_to_batch_dim(self, tensor, heads):
+        # 手動將 (batch * heads, seq_len, head_dim) -> (batch, seq_len, dim)
+        batch_value, seq_len, head_dim = tensor.shape
+        batch_size = batch_value // heads
+        tensor = tensor.reshape(batch_size, heads, seq_len, head_dim)
+        tensor = tensor.permute(0, 2, 1, 3)
+        return tensor.reshape(batch_size, seq_len, heads * head_dim)
+
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        
         query = attn.to_q(hidden_states)
 
         is_cross = encoder_hidden_states is not None
@@ -151,9 +167,10 @@ class AttackAttentionProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
         
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+        # [關鍵修改] 使用手動 Reshape 替代 attn.head_to_batch_dim
+        query = self._batch_to_head_dim(query, attn.heads)
+        key = self._batch_to_head_dim(key, attn.heads)
+        value = self._batch_to_head_dim(value, attn.heads)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
         
@@ -161,7 +178,10 @@ class AttackAttentionProcessor:
         self.store(attention_probs, is_cross, self.place)
         
         hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        
+        # [關鍵修改] 手動轉回 batch dim
+        hidden_states = self._head_to_batch_dim(hidden_states, attn.heads)
+        
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
@@ -238,17 +258,10 @@ def plot_facelock_history(history):
     print(f"Loss plot saved to: {save_path}")
     plt.close()
 
-# ==========================================
-# [新增] 輔助函式：處理 U-Net 輸入通道不匹配問題
-# ==========================================
+# 輔助函式：處理 U-Net 輸入通道不匹配問題
 def prepare_unet_input(unet, latents):
-    """
-    偵測 U-Net 需要的輸入通道數 (4 or 8) 並自動調整 latents。
-    InstructPix2Pix 需要 8 channels (latents + condition)，所以我們 duplicate latents。
-    """
     in_channels = unet.config.in_channels
     if in_channels == 8 and latents.shape[1] == 4:
-        # 重複 latents 以填補 condition channel
         return torch.cat([latents, latents], dim=1)
     return latents
 
@@ -285,7 +298,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
-            # [修正] 使用 prepare_unet_input 自動處理通道數
+            # 使用 prepare_unet_input 自動處理通道數
             unet_input = prepare_unet_input(sd_pipe.unet, latents_clean)
             
             _ = sd_pipe.unet(unet_input, target_timestep, encoder_hidden_states=empty_embeds)
@@ -313,7 +326,7 @@ def facelock(X, model, aligner, fr_model, lpips_fn=None,
             attention_store.reset()
             empty_embeds = sd_pipe._encode_prompt("", X.device, 1, False, None)[0]
             
-            # [修正] 使用 prepare_unet_input 自動處理通道數
+            # 使用 prepare_unet_input 自動處理通道數
             unet_input_adv = prepare_unet_input(sd_pipe.unet, latents_adv)
             
             _ = sd_pipe.unet(unet_input_adv, target_timestep, encoder_hidden_states=empty_embeds)
